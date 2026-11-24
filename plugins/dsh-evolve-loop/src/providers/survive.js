@@ -1,11 +1,10 @@
-﻿/**
+/**
  * Default population survival provider: keeps the top k alive candidates.
  *
  * @module dsh-evolve-loop/providers/survive
  */
 
 import { snapshot } from '../dart/search.js'
-import { utility } from '../dart/model.js'
 import { alive, merit } from '../population.js'
 
 export const name = 'top-k'
@@ -22,9 +21,10 @@ export async function survive(population, evolve) {
   const pool = alive(rows)
   if (evolve.currentRun?.().dart) {
     const state = await snapshot(evolve, rows)
-    const ranked = state.entries.filter(row => row.survival === 'yes')
-      .sort((a, b) => utility(b.vector) - utility(a.vector))
-    const kept = new Set([state.incumbent.id, ...ranked.map(row => row.id)].slice(0, k))
+    const ranked = state.entries.filter(row => row.survival === 'yes' && row.safe && row.channels.legal_rate > 0)
+      .sort((a, b) => b.robust - a.robust)
+    const lanes = [state.incumbent.id, state.archive.raw[0], state.archive.relative[0], state.archive.novelty[0]]
+    const kept = new Set([...new Set([...lanes.filter(Boolean), ...ranked.map(row => row.id)])].slice(0, k))
     await population.write(rows.map(row => ({ ...row, survival: kept.has(row.id) ? 'yes' : 'no' })))
     return
   }

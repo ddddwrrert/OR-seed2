@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Default parent selection provider: fitness-proportional roulette-wheel selection.
  *
  * @module dsh-evolve-loop/providers/select
@@ -16,8 +16,8 @@ export const name = 'fitness-proportional'
  * @param {object} evolve - the evolve service.
  * @returns {Promise<string>} selected candidate ID.
  */
-export async function select(population, evolve) {
-  if (evolve?.currentRun?.().dart) return await dartParent(evolve)
+export async function select(population, evolve, state) {
+  if (evolve?.currentRun?.().dart) return await dartParent(evolve, state)
   const rows = await population.rows()
   const pool = alive(rows)
   if (pool.length === 0) {

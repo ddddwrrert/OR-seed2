@@ -27,7 +27,7 @@ class StrategyComparisonTest(unittest.TestCase):
 
             write(run, "budget.json", {"max": 12})
             write(run, "dart/model.json", {"version": "model", "direction": 1,
-                                           "anchor": [{"low": 100, "scale": 20}]})
+                                           "anchor": [{"baseline": 100, "localBest": 120, "scale": 20, "mode": "difference"}]})
             write(run, "dart/protocol.json", {"version": "protocol"})
             write(run, "dart/budget.json", {"used": 50})
             candidate(run, "c000000", 100)

@@ -1,19 +1,19 @@
-import { copyFile, readFile } from 'node:fs/promises'
+import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { filesOf } from '../files.js'
 import { candidatePath } from '../candidates.js'
 import { evaluateResult } from '../providers/evaluate.js'
-import { archive, calibrate, cvar, decomposition, fixedEasyFloor, guarded, lexicase, mean, normalized, profiles, utility } from './model.js'
-import { accepted, BASE, BUDGETS, hash, PROBES, protocolFor, readJson, taskConfig, usable, writeJson } from './store.js'
+import { accepted, BASE, hash, protocolFor, readJson, taskConfig, usable, writeJson } from './store.js'
+import { acceptedCase, calibrate, clamp, cvar, evaluateChannels, gain, mean, normalized, regression, utility, weightedOrder } from './model.js'
+import { classify, clusterResponses, decomposition, difficultyRegistry, lineageWeights, seedProfiles } from './intelligence.js'
+import { advisor, archives, chooseParent, complementary, mechanismMemory, sourcePatch, WORKERS } from './strategy.js'
 
 const CHAMPION = 'dart/champion.json'
 const MODEL = 'dart/model.json'
-const ARMS = {
-  repair: 'Improve the target failure mode and preserve the current general logic. Implement one intervention.',
-  generalize: 'Improve the algorithm broadly. Explain the expected benefit and potential regressions in a short worker report.',
-  synthesize: 'Combine complementary mechanisms from the reference solutions in one solver. Choose a branch using problem-semantic features or online search diagnostics observable within the normal solve workflow. Never infer or match seed IDs, input hashes, exact instance fingerprints, or benchmark-specific lookup tables. Preserve a feasible fallback and stay within one total solve budget.',
-  ablate: 'Build the paired control. Disable only the intervention described in the target worker report, keeping the rest of the parent code and its budgets the same.',
-}
+const EVENTS = 'dart/mutations.jsonl'
+const REGISTRY = 'dart/difficulty-reference.json'
+const PROTECTION = 'dart/protection.json'
+const FORBIDDEN = /\b(?:OR_SEEDS|OR_TRACE_FILE|ALE_BENCH_SEED|seed_?id|instance_?hash|input_?sha256)\b/i
 
 export async function beginDart(task, root, maxBudget) {
   const settings = await taskConfig(task).catch(error => {
@@ -25,417 +25,435 @@ export async function beginDart(task, root, maxBudget) {
   const files = filesOf(root)
   const previous = await readJson(files, 'dart/protocol.json')
   if (previous && previous.version !== protocol.version) {
-    throw new Error('DART evaluation protocol changed. Start a separate task run to keep calibration and cache comparable.')
+    throw new Error('DART V4 evaluation protocol differs from the saved run. Use a new task copy; the old run is preserved.')
   }
   if (!previous) await writeJson(files, 'dart/protocol.json', protocol)
   return { protocol, settings }
 }
 
 const candidateFor = (evolve, id) => ({ id, dir: candidatePath(evolve.currentRun().root, id) })
-const recordFor = (id, purpose, fraction = 1) => purpose === 'search' ? `evals/${id}.json` :
-  `dart/evidence/${id}-${purpose}-${fraction}.json`
+const recordFor = (id, purpose) => purpose === 'search' ? `evals/${id}.json` : `dart/evidence/${id}-${purpose}-1.json`
 
-async function evidence(evolve, candidate, purpose, options = {}) {
-  const prior = await readJson(evolve.files, recordFor(candidate.id, purpose, options.fraction))
+async function evidence(evolve, candidate, purpose) {
   const { protocol, settings } = evolve.currentRun().dart
+  const seeds = purpose === 'search' ? protocol.seeds : protocol.validationSeeds
+  const prior = await readJson(evolve.files, recordFor(candidate.id, purpose))
   const source = await readFile(join(candidate.dir, settings.program))
   if (prior?.protocol === protocol.version && prior.source_sha256 === hash([source]) &&
-      usable(prior, options.seeds ?? protocol.seeds)) return prior
+      usable(prior, seeds)) return prior
   if (purpose === 'search') {
     await evolve.evaluate(candidate)
     const result = await readJson(evolve.files, recordFor(candidate.id, purpose))
-    if (result?.protocol !== evolve.currentRun().dart.protocol.version) {
-      throw new Error('DART evaluate providers must persist protocol-matched per-seed evidence. Delegate to the default evaluate provider.')
+    if (result?.protocol !== protocol.version || result.source_sha256 !== hash([source])) {
+      throw new Error('DART evaluate providers must persist evaluation evidence for the current source and protocol.')
     }
     return result
   }
-  return await evaluateResult(candidate, evolve, { ...options, purpose })
+  return evaluateResult(candidate, evolve, { purpose, seeds })
 }
 
 export async function initializeDart(evolve) {
   const files = evolve.files
   const { protocol } = evolve.currentRun().dart
   const population = evolve.population()
-  let rows = await population.rows()
-  let baseline = await readJson(files, recordFor(BASE, 'search'))
-  if (baseline?.protocol !== protocol.version || !usable(baseline, protocol.seeds)) {
-    const candidate = rows.length ? candidateFor(evolve, BASE) : await evolve.copyTask()
-    baseline = await evidence(evolve, candidate, 'search')
-  }
-  if (!usable(baseline, protocol.seeds)) {
-    throw new Error('The public baseline has no complete ALE-Bench evidence. See run/evals/c000000.json.')
-  }
+  const rows = await population.rows()
+  const candidate = rows.some(row => row.id === BASE) ? candidateFor(evolve, BASE) : await evolve.copyTask()
+  const baseline = await evidence(evolve, candidate, 'search')
+  if (!usable(baseline, protocol.seeds)) throw new Error('The initial program has no complete per-seed evidence.')
   if (!rows.some(row => row.id === BASE)) {
     await population.append({ id: BASE, parent: null, fitness: baseline.fitness, survival: 'yes' })
-    rows = await population.rows()
   }
-  const validation = await evidence(evolve, candidateFor(evolve, BASE), 'validation', { seeds: protocol.validationSeeds })
+  const validation = await evidence(evolve, candidate, 'validation')
   if (!usable(validation, protocol.validationSeeds) || validation.metrics.score_direction !== baseline.metrics.score_direction) {
-    throw new Error('The validation baseline has no comparable ALE-Bench evidence.')
+    throw new Error('The initial validation program has no comparable per-seed evidence.')
   }
-  const current = await readJson(files, CHAMPION)
-  const fixedModel = await readJson(files, MODEL)
-  const incumbent = current?.id && current.id !== BASE && fixedModel
-    ? await readJson(files, recordFor(current.id, 'search')) : undefined
-  const violatesFloor = incumbent && (!accepted(incumbent, protocol.seeds) ||
-    !fixedEasyFloor(incumbent.metrics.seed_results, baseline.metrics.seed_results, fixedModel))
-  if (violatesFloor) {
-    await files.append('dart/promotions.jsonl', JSON.stringify({
-      incumbent: current.id, challenger: BASE, certified: false, reason: 'incumbent violated the fixed raw easy-case floor',
-    }) + '\n')
+  if (!(await files.exists(CHAMPION))) {
+    await writeJson(files, CHAMPION, { id: BASE, fitness: baseline.fitness,
+      certified: accepted(baseline, protocol.seeds) && accepted(validation, protocol.validationSeeds) })
   }
-  if (!current || violatesFloor) {
-    await writeJson(files, CHAMPION, { id: BASE, fitness: baseline.fitness, certified: accepted(baseline, protocol.seeds) && accepted(validation, protocol.validationSeeds) })
+  if (!(await files.exists(PROTECTION))) {
+    await writeJson(files, PROTECTION, { id: BASE,
+      established: baseline.metrics.seed_results.flatMap((item, index) => acceptedCase(item) ? [index] : []) })
   }
 }
 
-// The panel is fixed in advance. Each recipe generates one frozen program and
-// all budgets reuse its source. Neither the champion nor later mutations recalibrate it.
-async function probeStep(evolve, probe) {
-  const files = evolve.files
-  const path = `dart/probes/${probe.name}.json`
-  let pin = await readJson(files, path)
-  if (!pin) {
-    const { settings } = evolve.currentRun().dart
-    const authored = settings.dart.probe_programs?.[probe.name]
-    let generated
-    if (authored) {
-      generated = await evolve.allocate(BASE)
-      await copyFile(join(evolve.currentRun().task, 'evaluator', authored), join(generated.dir, settings.program))
-    } else generated = await evolve.mutate({
-      parent: BASE,
-      name: `probe-${probe.name}`,
-      instruction: 'Read the statement. Edit only the solution between the EVOLVE markers. Do not run benchmarks. ' +
-        probe.instruction + ' Aim to return a valid solution within half of the official time limit. Never branch on seed IDs or input fingerprints.',
-    })
-    const source = await readFile(join(generated.dir, settings.program))
-    pin = { id: generated.id, recipe: probe.name, authored, source_sha256: hash([source]) }
-    await writeJson(files, path, pin)
-  }
-  const candidate = candidateFor(evolve, pin.id)
-  const source = await readFile(join(candidate.dir, evolve.currentRun().dart.settings.program))
-  if (hash([source]) !== pin.source_sha256) throw new Error(`Pinned DART probe changed: ${pin.id}`)
-  for (const fraction of BUDGETS) {
-    await evidence(evolve, candidate, fraction === 1 ? 'search' : 'probe', { fraction })
-  }
-  const population = evolve.population()
-  if (!(await population.rows()).some(row => row.id === pin.id)) {
-    const result = await readJson(files, recordFor(pin.id, 'search'))
-    await population.append({ id: pin.id, parent: BASE, fitness: result.fitness, survival: 'yes', probe: probe.name })
-  }
-}
-
-async function ensureModel(evolve, exploratoryProvider) {
-  const files = evolve.files
+async function loadHistory(evolve, rows) {
   const { protocol, settings } = evolve.currentRun().dart
-  const baseline = await readJson(files, recordFor(BASE, 'search'))
-  const probeIds = await Promise.all(PROBES.map(probe => readJson(files, `dart/probes/${probe.name}.json`)))
-  const results = []
-  for (const probe of probeIds.filter(Boolean)) {
-    for (const fraction of BUDGETS) {
-      const observation = await readJson(files, recordFor(probe.id, fraction === 1 ? 'search' : 'probe', fraction))
-      if (observation?.protocol === protocol.version && observation.source_sha256 === probe.source_sha256 &&
-          usable(observation, protocol.seeds) && observation.metrics.budget_fraction === fraction &&
-          observation.metrics.score_direction === baseline.metrics.score_direction) {
-        results.push(observation)
-      }
-    }
-  }
-  const complete = probeIds.every(Boolean) && results.length === PROBES.length * BUDGETS.length
-  const configured = Boolean(settings.dart.probe_programs?.greedy)
-  const finished = probeIds.every(Boolean) && (await evolve.population().rows()).filter(row => row.probe).length === PROBES.length
-  if (configured && finished && (!complete || results.some(result => result.metrics.budget_fraction === 1 &&
-      !result.metrics.seed_results.some(seed => seed.judge === 'ACCEPTED')))) {
-    throw new Error('DART fixed calibration requires complete paired observations and accepted full-budget runs')
-  }
-  const version = hash(['dual-anchor-v2', protocol.version, JSON.stringify([baseline, ...results].map(result => ({
-    source: result.source_sha256, budget: result.metrics.budget_fraction,
-    scores: result.metrics.seed_results.map(item => [item.seed, item.score, item.judge]),
-  })))])
-  const input = { baseline, probes: results, version }
-  const model = exploratoryProvider ? await evolve.dartComponent('dart-calibrate', input) :
-    await evolve.dartComponent('dart-calibrate', input, { defaultProvider: true })
-  const anchorsValid = model?.anchor?.length === protocol.seeds.length &&
-    model.anchor.every((item, index) => item.seed === protocol.seeds[index] &&
-      Number.isFinite(item.low) && Number.isFinite(item.scale) && item.scale > 0)
-  const casesValid = model?.cases?.length === protocol.seeds.length &&
-    model.cases.every((item, index) => item.seed === protocol.seeds[index] &&
-      item.index === index && Number.isFinite(item.difficulty))
-  if (!anchorsValid || !casesValid || model.direction !== (baseline.metrics.score_direction === 'maximize' ? 1 : -1)) {
-    throw new Error('DART calibration must return finite anchors and indexed difficulties for the current panel')
-  }
-  const calibrated = { ...model, version: exploratoryProvider ? hash([version, exploratoryProvider, JSON.stringify(model)]) : version,
-    calibration_status: complete && configured ? 'fixed' : complete ? 'generated' : 'degraded',
-    panel: probeIds.filter(Boolean) }
-  if (!exploratoryProvider) await writeJson(files, MODEL, calibrated)
-  return calibrated
+  const records = await Promise.all(rows.map(async row => {
+    const result = await readJson(evolve.files, recordFor(row.id, 'search'))
+    const bytes = await readFile(join(candidateFor(evolve, row.id).dir, settings.program))
+      .catch(error => { if (error.code !== 'ENOENT') throw error; return undefined })
+    const code = bytes?.toString('utf8') ?? ''
+    const raw = result?.metrics?.seed_results
+    const match = bytes && result?.protocol === protocol.version && result.source_sha256 === hash([bytes])
+    const problems = result?.metrics?.evaluation_failure ?? result?.metrics?.judge_result ??
+      (result?.metrics?.error !== undefined ? 'EVALUATION_ERROR' : 'MISSING_EVIDENCE')
+    const bySeed = new Map((match && Array.isArray(raw) ? raw : []).map(item => [item.seed, item]))
+    return { ...row, fitness: match ? result.fitness : 0, code, source: match ? result.source_sha256 : undefined, result,
+      safe: match && !FORBIDDEN.test(code), raw: protocol.seeds.map(seed => bySeed.get(seed) ??
+        { seed, score: null, judge: match ? problems : 'MISSING_EVIDENCE' }) }
+  }))
+  records.sort((a, b) => a.id.localeCompare(b.id))
+  return records
+}
+
+function eventMetrics(event, byId, model, hard) {
+  const parent = byId.get(event.parent)
+  const child = byId.get(event.id)
+  if (!parent || !child) return { ...event, delta: model.anchor.map(() => null), reward: -1 }
+  const delta = model.anchor.map((anchor, index) => gain(child.raw[index], parent.raw[index], anchor, model.direction))
+  const cost = (event.seed_cost ?? 0) / model.anchor.length + Math.min((event.elapsed_ms ?? 0) / 60000, 1)
+  const reward = child.channels.legal_rate ? clamp(utility(child, parent, model, hard) - 0.03 * cost, -1, 1) : -1
+  return { ...event, delta, reward, normalizer: model.version }
 }
 
 export async function snapshot(evolve, rows = undefined) {
   rows ??= await evolve.population().rows()
   const files = evolve.files
-  const fixedModel = await readJson(files, MODEL)
-  const calibration = evolve.getProvider('dart-calibrate')
-  const model = calibration.run === DART_COMPONENTS['dart-calibrate']
-    ? fixedModel : await ensureModel(evolve, calibration.name || 'custom')
-  const champion = await readJson(files, CHAMPION)
-  const { protocol } = evolve.currentRun().dart
-  const direction = model.direction === 1 ? 'maximize' : 'minimize'
-  const entries = (await Promise.all(rows.map(async row => {
-    const result = await readJson(files, recordFor(row.id, 'search'))
-    if (result?.protocol !== protocol.version || !usable(result, protocol.seeds) ||
-        result.metrics.score_direction !== direction) return undefined
-    const vector = await evolve.dartComponent('dart-normalize', { result, model })
-    if (!Array.isArray(vector) || vector.length !== protocol.seeds.length || !vector.every(Number.isFinite)) {
-      throw new Error('DART normalization must return one finite value per seed')
+  const { protocol, settings: { dart: settings } } = evolve.currentRun().dart
+  const logged = (await files.read(EVENTS) ?? '').split('\n').filter(Boolean).map(line => JSON.parse(line))
+  const entries = classify(await loadHistory(evolve, rows), logged)
+  const baseline = entries.find(entry => entry.id === BASE)
+  if (!baseline?.result) throw new Error('DART baseline evidence is missing')
+  const reference = baseline.result.metrics.score_direction
+  for (const entry of entries) {
+    if (entry.result?.metrics?.score_direction !== reference) {
+      entry.raw = entry.raw.map(item => acceptedCase(item) ? { seed: item.seed, score: null, judge: 'SCORE_DIRECTION_MISMATCH' } : item)
+      entry.safe = false
     }
-    const effects = await evolve.dartComponent('dart-decompose', { vector, model })
-    return { ...row, vector, effects, raw: result.metrics.seed_results,
-      source: result.source_sha256 }
-  }))).filter(Boolean)
-  const incumbent = entries.find(entry => entry.id === champion.id)
-  if (!incumbent) throw new Error('DART champion evidence is missing or incompatible')
-  const diagnostic = await evolve.dartComponent('dart-cluster', { entries, model, incumbent })
-  const experts = await evolve.dartComponent('dart-archive', {
-    entries: entries.filter(entry => entry.raw.some(item => item.judge === 'ACCEPTED')),
-    groups: diagnostic.groups,
+  }
+  const history = entries.filter(entry => entry.safe && entry.raw.some(acceptedCase))
+  const seen = new Set()
+  const unique = history.filter(entry => {
+    if (seen.has(entry.source)) return false
+    seen.add(entry.source)
+    return true
   })
-  return { entries, model, fixedModel, incumbent, ...diagnostic, experts }
+  const weights = lineageWeights(unique)
+  const version = hash(['dart-v4-gain', protocol.version, JSON.stringify(unique.map(entry => [entry.source,
+    entry.raw.map(item => [item.score, item.judge])]))])
+  const input = { baseline: baseline.result, history: unique, weights, settings, version }
+  const fixedModel = calibrate(input)
+  const model = await evolve.dartComponent('dart-calibrate', input)
+  if (model?.direction !== fixedModel.direction || model.anchor?.length !== protocol.seeds.length ||
+      model.anchor.some((item, index) => item.seed !== protocol.seeds[index] || !Number.isFinite(item.scale) || item.scale <= 0)) {
+    throw new Error('DART evaluation components must provide a positive common scale for each seed')
+  }
+  const frozen = await readJson(files, REGISTRY)
+  const registry = difficultyRegistry(history.length ? history : [baseline], weights, fixedModel, settings.quality_reference,
+    frozen, settings.min_reference_programs, baseline)
+  if (registry.frozen && registry !== frozen) {
+    if (frozen) await writeJson(files, `dart/reference-history/${frozen.normalizer}.json`, frozen)
+    await writeJson(files, REGISTRY, registry)
+  }
+  const protection = await readJson(files, PROTECTION)
+  const hard = registry.cases.flatMap((item, index) => item.confidence >= 0.65 &&
+    item.reference_difficulty !== null && item.reference_difficulty >= 0.65 ? [index] : [])
+  const stable = protocol.seeds.flatMap((_, index) => acceptedCase(baseline.raw[index]) && history.length >= 4 &&
+    mean(history.map(entry => Number(acceptedCase(entry.raw[index])))) >= 0.9 ? [index] : [])
+  const easy = registry.cases.flatMap((item, index) => item.confidence >= 0.65 &&
+    item.reference_difficulty !== null && item.reference_difficulty <= 0.35 ? [index] : [])
+  const protectedCases = [...new Set([...protection.established, ...stable, ...easy])]
+  const validVector = vector => Array.isArray(vector) && vector.length === protocol.seeds.length &&
+    vector.every(value => value === null || Number.isFinite(value))
+  for (const entry of entries) {
+    entry.vector = await evolve.dartComponent('dart-normalize', { result: { metrics: { seed_results: entry.raw } }, model })
+    if (!validVector(entry.vector)) throw new Error('DART normalize must return one finite value or null per seed')
+    entry.channels = evaluateChannels(entry, fixedModel)
+    entry.regression = regression(entry, baseline, fixedModel, protectedCases, settings)
+    entry.robust = entry.channels.relative - 0.5 * entry.channels.cvar
+  }
+  const effects = await evolve.dartComponent('dart-decompose', { entries, model, registry, quality: settings.quality_reference })
+  for (const [index, entry] of entries.entries()) entry.effects = effects[index]
+  const current = await readJson(files, CHAMPION)
+  const champion = entries.find(entry => entry.id === current.id)
+  if (!champion) throw new Error('DART champion evidence is missing')
+  const byId = new Map(entries.map(entry => [entry.id, entry]))
+  const events = logged.map(event => eventMetrics(event, byId, fixedModel, hard))
+  const mechanisms = mechanismMemory(events)
+  const cases = seedProfiles({ incumbent: champion, entries, model, registry, events, protectedCases })
+  const diagnostic = await evolve.dartComponent('dart-cluster', { entries, model, incumbent: champion, events })
+  const archive = await evolve.dartComponent('dart-archive', { entries, groups: diagnostic.groups, cases, mechanisms })
+  return { entries, byId, model, fixedModel, incumbent: champion, baseline, cases, registry, events, hard,
+    archive, settings, mechanisms, ...diagnostic }
 }
 
-export async function dartParent(evolve, state) {
-  const { entries, incumbent, cases, experts } = state ?? await snapshot(evolve)
-  const elite = new Set([incumbent.id, ...experts.flat()])
-  const eligible = entries.filter(entry => (entry.survival === 'yes' || elite.has(entry.id)) &&
-    (entry.id === incumbent.id || entry.raw.some(item => item.judge === 'ACCEPTED')))
-  const parent = await evolve.dartComponent('dart-parent', { entries: eligible, cases })
-  if (!eligible.some(entry => entry.id === parent)) throw new Error('DART parent must come from the eligible pool')
-  return parent
+export async function dartParent(evolve, state = undefined) {
+  state ??= await snapshot(evolve)
+  const elite = new Set([state.incumbent.id, ...Object.values(state.archive).flat(3)])
+  const entries = state.entries.filter(entry => (entry.survival === 'yes' || elite.has(entry.id)) &&
+    entry.safe && (entry.id === state.incumbent.id || entry.channels.legal_rate > 0))
+  const picked = await evolve.dartComponent('dart-parent', { ...state, entries })
+  const decision = typeof picked === 'string' ? { id: picked, mode: 'custom' } : picked
+  if (!entries.some(entry => entry.id === decision?.id)) throw new Error('DART parent must come from the eligible pool')
+  state.selection = decision
+  return decision.id
 }
 
-function armChoice(events, context, eligible) {
-  const observations = events.filter(event => event.context === context && Number.isFinite(event.reward))
-  return [...eligible].sort((a, b) => {
-    const score = arm => {
-      const rewards = observations.filter(event => event.arm === arm).map(event => event.reward)
-      return rewards.length ? mean(rewards) + Math.sqrt(2 * Math.log(observations.length + 1) / rewards.length) : Infinity
-    }
-    const left = score(a)
-    const right = score(b)
-    return left === right ? 0 : right - left
-  })[0]
+function armChoice({ recommendation = [], eligible, settings = {}, conflict = 0 }) {
+  const weights = { ...Object.fromEntries(Object.entries(WORKERS).map(([name, item]) => [name, item.weight])),
+    ...settings.worker_weights }
+  return weightedOrder(eligible, arm => weights[arm] *
+    (1 + 0.2 * clamp(recommendation.find(item => item.arm === arm)?.mean ?? 0, -1, 1)) *
+    (arm === 'adaptive' || arm === 'transfer' ? 1 + conflict : 1))[0]
 }
 
 async function dispatch(evolve, state, selected) {
-  const files = evolve.files
-  const events = (await files.read('dart/mutations.jsonl') ?? '').split('\n').filter(Boolean).map(line => JSON.parse(line))
-  const groups = [...state.groups].sort((a, b) =>
-    mean(b.map(index => state.cases[index].gap)) - mean(a.map(index => state.cases[index].gap)))
-  const focus = groups[0]
-  const ranked = focus.map(index => state.cases[index]).sort((a, b) => b.gap - a.gap)
-  const context = mean(focus.map(index => state.cases[index].gap)) > 0.1 ? 'large-gap' : 'small-gap'
-  const selectedEntry = state.entries.find(entry => entry.id === selected) ?? state.incumbent
-  const entries = new Map(state.entries.map(entry => [entry.id, entry]))
-  const references = [...new Set(state.experts.flatMap(([id], cluster) => {
-    const expert = entries.get(id)
-    const indices = state.groups[cluster]
-    if (!expert || id === selected) return []
-    const advantage = mean(indices.map(index => expert.vector[index] - selectedEntry.vector[index]))
-    return advantage > 0 ? [id] : []
-  }))].slice(0, 3)
-  const completed = new Set(events.filter(event => event.arm === 'ablate').map(event => event.ablationOf))
-  const target = [...events].reverse().find(event => event.arm !== 'ablate' && event.reward > 0 &&
-    event.report && !completed.has(event.id))
-  const eligible = ['repair', 'generalize']
-  if (references.length) eligible.push('synthesize')
-  if (target) eligible.push('ablate')
-  const arm = await evolve.dartComponent('dart-arm', { events, context, eligible })
-  if (!eligible.includes(arm)) throw new Error('DART dispatch selected an unavailable action')
-  const parent = arm === 'ablate' ? target.id : selected
-  const parentEntry = state.entries.find(entry => entry.id === parent) ?? state.incumbent
-  const timeouts = parentEntry.raw.filter(item => item.judge === 'TIME_LIMIT_EXCEEDED').length
-  const diagnostics = ranked.slice(0, 4).map(({ index, difficulty, gap }) => {
-    const item = parentEntry.raw[index]
-    return { difficulty, gap, status: item.judge, seconds: item.seconds, input_bytes: item.input_bytes }
-  })
+  const parent = state.byId.get(selected)
+  if (!parent?.safe) throw new Error('DART dispatch requires an evaluated in-pool parent')
+  const targetCase = weightedOrder(state.cases, item => item.priority)[0]
+  const focus = state.groups.find(group => group.includes(targetCase.index)) ?? [targetCase.index]
+  const conflicts = state.conflicts.filter(item => focus.includes(item.left) || focus.includes(item.right)).slice(0, 4)
+  const donors = complementary(parent, state.entries, state.cases, state.fixedModel)
+  const donor = state.selection?.donor ?? donors[0]?.id
+  const { budget } = await evolve.context()
+  const cohort = focus.map(index => state.cases[index])
+  const context = [
+    mean(cohort.map(item => item.gap)) >= 0.1 ? 'gap' : 'close',
+    cohort.some(item => item.regression > 0.03) ? 'loss' : 'stable',
+    mean(cohort.map(item => item.exposure)) < 3 ? 'underexplored' : 'observed',
+    mean(cohort.map(item => item.search_difficulty)) > 0.65 ? 'stalled' : 'open',
+    cohort.some(item => item.reference_difficulty !== null && item.confidence >= 0.65) ? 'known' : 'unknown',
+    budget.remaining <= 5 ? 'low-budget' : 'budget',
+  ].join('/')
+  const recommendation = await evolve.dartComponent('dart-advisor', { events: state.events, context, cases: cohort, budget })
+  const target = [...state.mechanisms].reverse().find(item => item.status === 'OBSERVED' &&
+    !state.events.some(event => event.attribution_of === item.id && event.control_status === 'paired') &&
+    state.byId.get(item.id)?.safe)
+  const eligible = ['global', 'hard', 'repair', 'exploration']
+  if (donor) eligible.push('transfer', 'adaptive')
+  if (target) eligible.push('attribution')
+  const allowed = eligible.filter(arm => (state.settings.worker_weights?.[arm] ?? WORKERS[arm].weight) > 0)
+  const arm = await evolve.dartComponent('dart-arm', { events: state.events, context,
+    eligible: allowed.length ? allowed : eligible, recommendation, settings: state.settings,
+    conflict: Math.max(0, ...conflicts.map(item => item.weight * (item.controlled ? 2 : 1))) })
+  if (!eligible.includes(arm)) throw new Error('DART dispatch selected an unavailable worker')
+  const useDonor = arm === 'transfer' || arm === 'adaptive'
+  let chosen = parent
+  if (arm === 'attribution') chosen = state.byId.get(target.id)
+  if (arm === 'repair') chosen = [...state.entries].filter(entry =>
+    entry.safe && entry.channels.legal_rate === 1 && entry.regression.loss > 0.02)
+    .sort((a, b) => b.channels.relative - a.channels.relative)[0] ?? parent
+  const hints = state.mechanisms.filter(item => item.gains?.some((value, index) => focus.includes(index) && Math.abs(value ?? 0) >= 0.02))
+    .sort((a, b) => Number(a.status === 'PAIRED') - Number(b.status === 'PAIRED')).slice(-6)
+    .map(item => ({ tags: item.tags, status: item.status, expected_gain: mean(focus.map(index => item.gains[index] ?? 0)) }))
+  const diagnostics = cohort.slice(0, 6).map(({ index, gap, reference_difficulty, difficulty_status, exposure, regression }) => ({
+    gap, reference_difficulty, difficulty_status, exposure, regression, judge: chosen.raw[index].judge,
+    seconds: chosen.raw[index].seconds, input_bytes: chosen.raw[index].input_bytes,
+  }))
+  const purpose = useDonor ? state.mechanisms.find(item => item.id === donor) : undefined
   const instruction = [
-    'Read the problem and edit only the solution between EVOLVE markers. Do not run benchmark evaluators.',
-    'Protect general performance and easy cases. Use only problem semantics or online diagnostics to adapt. Never match seeds, hashes or exact input fingerprints.',
-    'Emit one short text report describing the intervention and the expected effect.',
-    `Parent timeouts: ${timeouts}. Target cohort summaries: ${JSON.stringify(diagnostics)}`,
-    ARMS[arm],
-    arm === 'ablate' ? `Intervention to disable: ${target.report}` : '',
+    'Read the task and edit only the solution between EVOLVE markers. Do not run benchmark evaluators.',
+    'Never match instance identifiers, exact input fingerprints or leaderboard data. Use only task semantics and observable search state.',
+    'Emit a short report including a line Mechanism: <one algorithmic intervention>.',
+    arm === 'adaptive' ? 'Also describe Router:, Fallback:, and Budget: on separate lines.' : '',
+    WORKERS[arm].task,
+    `Target cohort: ${JSON.stringify(diagnostics)}. Protected cases: ${state.cases.filter(item => item.protected).length}.`,
+    `Observed conflicts: ${JSON.stringify(conflicts.map(({ weight, controlled }) => ({ weight, controlled })))}. Prior mechanisms: ${JSON.stringify(hints)}.`,
+    purpose ? `Donor mechanism: ${purpose.tags.join(', ')} (${purpose.status}). Donor changed near line ${purpose.patch.line}.` : '',
+    arm === 'attribution' ? `Reverse intervention ${target.tags[0]} at line ${target.patch.line}. Original edit: ${JSON.stringify(target.patch).slice(0, 5000)}` : '',
   ].filter(Boolean).join('\n')
-  return { parent, instruction, name: `dart-${arm}`, arm, context, focus,
-    referenceIds: arm === 'synthesize' ? references : [], ablationOf: arm === 'ablate' ? target.id : undefined }
+  return { parent: chosen.id, parent_mode: state.selection?.mode ?? 'custom', instruction, name: `dart-${arm}`, arm, context, focus,
+    referenceIds: useDonor ? [donor] : arm === 'attribution' ? [target.parent] : [],
+    attributionOf: arm === 'attribution' ? target.id : undefined }
 }
 
-function validationGuard(candidate, incumbent, baseline, direction) {
-  const raw = result => result.metrics.seed_results
-  const delta = raw(candidate).map((item, index) => {
-    const fixed = raw(baseline)[index]
-    const reference = raw(incumbent)[index]
-    if (reference.judge !== 'ACCEPTED') return 0
-    const change = direction * (item.score - reference.score)
-    if (fixed.score !== 0) return change / Math.abs(fixed.score)
-    // A zero baseline supplies no relative scale. Require no loss for that seed.
-    return change < 0 ? -Infinity : 0
+function validationGuard(candidate, reference, baseline, direction) {
+  const delta = candidate.metrics.seed_results.map((item, index) => {
+    const before = reference.metrics.seed_results[index]
+    const fixed = baseline.metrics.seed_results[index]
+    if (!acceptedCase(before)) return 0
+    const change = direction * (item.score - before.score)
+    if (fixed.score === 0) return change < 0 ? -Infinity : 0
+    return change / Math.abs(fixed.score)
   })
-  return delta.every(Number.isFinite) && mean(delta) >= -0.005 && cvar(delta) >= -0.05
+  return delta.every(Number.isFinite) && mean(delta) >= -0.005 && cvar(delta.map(value => Math.max(0, -value))) <= 0.05
 }
 
-async function consider(evolve, id, state) {
-  const files = evolve.files
-  const { protocol, settings } = evolve.currentRun().dart
-  const result = await readJson(files, recordFor(id, 'search'))
-  if (result?.protocol !== protocol.version || !accepted(result, protocol.seeds) ||
-      result.metrics.score_direction !== (state.model.direction === 1 ? 'maximize' : 'minimize')) return
-  const challengerSource = await readFile(join(candidateFor(evolve, id).dir, settings.program))
-  if (result.source_sha256 !== hash([challengerSource])) return
-  // The program never receives a seed ID. Block explicit harness or seed-ID
-  // dispatch hooks if a worker introduces them in a proposed solver.
-  const forbidden = /\b(?:OR_SEEDS|OR_TRACE_FILE|ALE_BENCH_SEED|seed_?id|instance_?hash|input_?sha256)\b/i
-  if (forbidden.test(challengerSource.toString())) return
-  const fixed = state.fixedModel
-  const baselineResult = await readJson(files, recordFor(BASE, 'search'))
-  if (!fixedEasyFloor(result.metrics.seed_results, baselineResult.metrics.seed_results, fixed)) {
-    await files.append('dart/promotions.jsonl', JSON.stringify({
-      challenger: id, incumbent: state.incumbent.id, certified: false, reason: 'fixed raw easy-case floor',
+async function consider(evolve, entry, state) {
+  const { protocol } = evolve.currentRun().dart
+  if (!entry.safe || !accepted(entry.result, protocol.seeds)) return false
+  const current = await readJson(evolve.files, CHAMPION)
+  if (!entry.regression.allowed) {
+    await evolve.files.append('dart/promotions.jsonl', JSON.stringify({
+      challenger: entry.id, incumbent: current.id, certified: false, reason: 'fixed long-term regression guard',
     }) + '\n')
-    return
+    return false
   }
-  const vector = normalized(result, fixed)
-  const incumbentVector = normalized(await readJson(files, recordFor(state.incumbent.id, 'search')), fixed)
-  const current = await readJson(files, CHAMPION)
-  if (current.certified && !(utility(vector) > utility(incumbentVector) &&
-    result.fitness > state.incumbent.fitness)) return
-  if (!guarded(vector, incumbentVector, fixed)) return
-  if (await evolve.dartComponent('dart-promote', { id, vector, incumbent: incumbentVector, model: fixed }) !== true) return
-  const validation = { seeds: protocol.validationSeeds }
-  const baseline = await evidence(evolve, candidateFor(evolve, BASE), 'validation', validation)
-  const incumbent = await evidence(evolve, candidateFor(evolve, current.id), 'validation', validation)
-  const challenger = await evidence(evolve, candidateFor(evolve, id), 'validation', validation)
+  const incumbent = state.incumbent
+  if (current.certified && utility(entry, incumbent, state.fixedModel, state.hard) <= 0) return false
+  if (await evolve.dartComponent('dart-promote', { entry, incumbent, model: state.fixedModel }) !== true) return false
+  const baseline = await evidence(evolve, candidateFor(evolve, BASE), 'validation')
+  const previous = await evidence(evolve, candidateFor(evolve, current.id), 'validation')
+  const challenger = await evidence(evolve, candidateFor(evolve, entry.id), 'validation')
   const certified = accepted(challenger, protocol.validationSeeds) &&
-    challenger.metrics.score_direction === result.metrics.score_direction &&
-    validationGuard(challenger, incumbent, baseline, state.model.direction) &&
+    challenger.metrics.score_direction === entry.result.metrics.score_direction &&
+    validationGuard(challenger, previous, baseline, state.model.direction) &&
     validationGuard(challenger, baseline, baseline, state.model.direction)
-  await files.append('dart/promotions.jsonl', JSON.stringify({
-    challenger: id, incumbent: current.id, version: fixed.version,
-    certified, public_fitness: result.fitness, normalized_mean: mean(vector), cvar: cvar(vector),
+  await evolve.files.append('dart/promotions.jsonl', JSON.stringify({
+    challenger: entry.id, incumbent: current.id, version: state.fixedModel.version,
+    certified, original_score: entry.fitness, relative: entry.channels.relative, cvar: entry.channels.cvar,
   }) + '\n')
-  if (certified) await writeJson(files, CHAMPION, { id, fitness: result.fitness, certified, version: fixed.version })
-}
-
-async function modelOrBuild(evolve) {
-  return await readJson(evolve.files, MODEL) ?? await ensureModel(evolve)
+  if (certified) await writeJson(evolve.files, CHAMPION, { id: entry.id, fitness: entry.fitness, certified,
+    source_sha256: entry.source, version: state.fixedModel.version })
+  return certified
 }
 
 export async function dartStep(evolve) {
+  const { protocol, settings } = evolve.currentRun().dart
   const files = evolve.files
   const population = evolve.population()
-  const available = (await evolve.context()).budget
-  const { protocol } = evolve.currentRun().dart
-  const seedBudget = await readJson(files, 'dart/budget.json')
-  if (protocol.maxSeeds - (seedBudget?.used ?? 0) < protocol.seeds.length) {
+  const before = await readJson(files, 'dart/budget.json')
+  if (protocol.maxSeeds - (before?.used ?? 0) < protocol.seeds.length) {
     throw Object.assign(new Error('DART seed evaluation budget exhausted'), { code: 'DART_BUDGET' })
   }
-  const { settings } = evolve.currentRun().dart
-  const hasPanel = settings.dart.probe_programs?.greedy || settings.dart.allow_generated_probes
-  if (hasPanel && !(await files.exists(MODEL)) && available.max >= PROBES.length + 1) {
-    for (const probe of PROBES) {
-      const pin = await readJson(files, `dart/probes/${probe.name}.json`)
-      if (!pin || !(await population.rows()).some(row => row.id === pin.id)) {
-        await probeStep(evolve, probe)
-        return
-      }
-    }
-  }
-  await modelOrBuild(evolve)
   const state = await snapshot(evolve)
-  const parent = await evolve.select(population)
-  const dispatched = await evolve.dartComponent('dart-dispatch', { state, selected: parent })
-  const plan = {
-    ...dispatched,
-    instruction: dispatched.instruction + '\nAdapt only to problem semantics or online diagnostics. Never match seed IDs, exact instance fingerprints, or benchmark lookup tables.',
+  const parent = await evolve.select(population, state)
+  const plan = await evolve.dartComponent('dart-dispatch', { state, selected: parent })
+  if (!state.byId.get(plan.parent)?.safe || !Array.isArray(plan.focus) ||
+      plan.focus.some(index => !Number.isInteger(index) || !state.cases[index])) {
+    throw new Error('DART dispatch must select a known parent and focus indices inside the panel')
   }
   const candidate = await evolve.mutate(plan)
   const result = await evidence(evolve, candidate, 'search')
-  await population.append({ id: candidate.id, parent: plan.parent, fitness: result.fitness, survival: 'yes', arm: plan.arm })
-  const original = state.entries.find(entry => entry.id === plan.parent)
-  const vector = usable(result, protocol.seeds) && result.metrics.score_direction === (state.model.direction === 1 ? 'maximize' : 'minimize')
-    ? await evolve.dartComponent('dart-normalize', { result, model: state.model }) : undefined
-  if (vector && (!Array.isArray(vector) || vector.length !== protocol.seeds.length || !vector.every(Number.isFinite))) {
-    throw new Error('DART normalization must return one finite value per seed')
-  }
-  const delta = original && vector ? vector.map((value, index) => value - original.vector[index]) : undefined
-  const reward = delta ? Math.max(-1, Math.min(1, 0.7 * mean(plan.focus.map(index => delta[index])) + 0.3 * cvar(delta))) : -1
-  const changedSource = original?.source && result.source_sha256 && original.source !== result.source_sha256
-  const pairedEffect = plan.ablationOf && changedSource && candidate.report && delta
+  const original = state.byId.get(plan.parent)
+  const code = await readFile(join(candidate.dir, settings.program), 'utf8')
+  const patch = sourcePatch(original.code, code)
+  const intervention = state.events.find(event => event.id === plan.attributionOf)
+  const exactReversion = intervention && state.byId.get(intervention.parent)?.code === code && original.code !== code
+  const after = await readJson(files, 'dart/budget.json')
+  await population.append({ id: candidate.id, parent: plan.parent, fitness: result.fitness,
+    survival: 'yes', arm: plan.arm })
+  const newEntry = { id: candidate.id, raw: protocol.seeds.map((seed, index) =>
+    result.metrics?.seed_results?.[index] ?? { seed, score: null }), fitness: result.fitness }
+  newEntry.channels = evaluateChannels(newEntry, state.fixedModel)
+  newEntry.regression = regression(newEntry, state.baseline, state.fixedModel,
+    state.cases.filter(item => item.protected).map(item => item.index), state.settings)
   const event = {
-    id: candidate.id, parent: plan.parent, arm: plan.arm, context: plan.context, focus: plan.focus,
-    report: candidate.report, source: result.source_sha256, parent_source: original?.source, delta, reward: plan.arm === 'ablate' ? (pairedEffect ? Math.abs(reward) : -1) : reward,
-    ablationOf: plan.ablationOf, references: plan.referenceIds,
-    control_status: plan.ablationOf ? (pairedEffect ? 'observed' : 'unverified') : undefined,
-    intervention_effect: pairedEffect ? delta.map(value => -value) : undefined,
+    id: candidate.id, parent: plan.parent, parent_mode: plan.parent_mode, arm: plan.arm,
+    context: plan.context, focus: plan.focus, focus_seeds: plan.focus.map(index => state.cases[index].seed),
+    router: plan.arm === 'adaptive' ? Object.fromEntries(['Router', 'Fallback', 'Budget'].flatMap(field => {
+      const value = candidate.report?.split('\n').find(line => line.startsWith(field + ':'))?.slice(field.length + 1).trim()
+      return value ? [[field.toLowerCase(), value]] : []
+    })) : undefined,
+    report: candidate.report, mechanism: candidate.report?.match(/(?:^|\n)Mechanism:\s*([^\n]+)/i)?.[1]?.trim(),
+    source: result.source_sha256, parent_source: original.source, patch, attribution_of: plan.attributionOf,
+    control_status: intervention ? exactReversion && newEntry.channels.legal_rate === 1 ? 'paired' : 'observed' : undefined,
+    references: plan.referenceIds, seed_cost: after.used - before.used, elapsed_ms: result.cache_hit ? 0 : result.elapsed_ms,
   }
-  await files.append('dart/mutations.jsonl', JSON.stringify(event) + '\n')
+  const measured = eventMetrics(event, new Map([...state.byId, [candidate.id, newEntry]]), state.fixedModel, state.hard)
+  await files.append(EVENTS, JSON.stringify(measured) + '\n')
   if ((await population.rows()).filter(row => row.survival === 'yes').length >= (await evolve.context()).maxPopulation) {
     await evolve.survive(population)
   }
 }
 
+async function chooseSubmission(evolve, state) {
+  const selected = state.settings.submission_objective ?? (state.settings.scoring === 'relative' ? 'relative' : 'raw')
+  const { protocol } = evolve.currentRun().dart
+  const pool = [...new Set([...state.archive[selected], state.incumbent.id])].map(id => state.byId.get(id)).filter(Boolean)
+  const ordered = await evolve.dartComponent('dart-submission-order', { pool, selected })
+  if (!Array.isArray(ordered) || ordered.some(id => !pool.some(entry => entry.id === id))) {
+    throw new Error('DART submission order must reference locally evaluated archive candidates')
+  }
+  for (const id of [...new Set([...ordered, ...pool.map(entry => entry.id)])]) {
+    const entry = state.byId.get(id)
+    if (!entry?.safe || !accepted(entry.result, protocol.seeds)) continue
+    try {
+      const result = await evidence(evolve, candidateFor(evolve, id), 'validation')
+      if (!accepted(result, protocol.validationSeeds) || result.metrics.score_direction !== entry.result.metrics.score_direction) continue
+      await writeJson(evolve.files, 'dart/submission.json', { id, objective: selected, source_sha256: entry.source,
+        original_score: entry.fitness, local_relative: entry.channels.relative, tail_gap: entry.channels.cvar,
+        validation: 'LEGAL' })
+      return id
+    } catch (error) {
+      if (error.code !== 'DART_BUDGET') throw error
+    }
+  }
+  if (await evolve.files.exists('dart/submission.json')) await evolve.files.remove('dart/submission.json')
+  return undefined
+}
+
 export async function finishDart(evolve, result, preTrialIds) {
   const files = evolve.files
-  if (!(await files.exists(CHAMPION))) throw new Error('DART baseline initialization did not finish')
-  const rows = await evolve.population().rows()
-  let state
-  if (await files.exists(MODEL) || rows.filter(row => row.probe).length === PROBES.length ||
-      (await evolve.context()).budget.remaining === 0) {
-    await modelOrBuild(evolve)
-    state = await snapshot(evolve, rows)
-    if (!result?.seed_budget_exhausted) {
-      const ranked = await Promise.all(state.entries.map(async entry => ({
-        entry, priority: await evolve.dartComponent('dart-rank', { entry, state }),
-      })))
-      const ordered = ranked.sort((a, b) => b.priority - a.priority).map(item => item.entry)
-      for (const entry of ordered) {
-        try {
-          if (entry.id !== state.incumbent.id && !preTrialIds?.has(entry.id)) await consider(evolve, entry.id, state)
-        } catch (error) {
-          if (error.code !== 'DART_BUDGET') throw error
+  let state = await snapshot(evolve)
+  if (!result?.seed_budget_exhausted && !result?.refresh_only) {
+    const ranked = await Promise.all(state.entries.filter(entry => entry.id !== state.incumbent.id &&
+      entry.channels.legal_rate === 1 && !preTrialIds?.has(entry.id)).map(async entry => ({
+      entry, rank: await evolve.dartComponent('dart-rank', { entry, state }),
+    })))
+    for (const { entry } of ranked.sort((a, b) => b.rank - a.rank)) {
+      try {
+        if (await consider(evolve, entry, state)) {
+          state = await snapshot(evolve)
           break
         }
-        if ((await readJson(files, CHAMPION)).id !== state.incumbent.id) {
-          state = await snapshot(evolve, rows)
-          break
-        }
+      } catch (error) {
+        if (error.code !== 'DART_BUDGET') throw error
+        break
       }
     }
-    await writeJson(files, 'dart/diagnostics.json', {
-      version: state.model.version, calibration_status: state.model.calibration_status, cases: state.cases,
-      clusters: state.groups.map(group => group.map(index => state.cases[index].seed)),
-      experts: state.experts,
-      programs: state.entries.map(({ id, effects, vector }) => ({ id, ...effects, mean: mean(vector), cvar: cvar(vector) })),
-    })
   }
+  const submission = preTrialIds ? undefined : await chooseSubmission(evolve, state)
+  await writeJson(files, MODEL, state.fixedModel)
+  await writeJson(files, 'dart/archives.json', state.archive)
+  await writeJson(files, 'dart/mechanisms.json', state.mechanisms)
+  await writeJson(files, 'dart/diagnostics.json', {
+    version: state.fixedModel.version, reference_frozen: state.registry.frozen,
+    source_families: state.registry.cohorts, cases: state.cases, clusters: state.groups.map(group => group.map(index => state.cases[index].seed)),
+    conflicts: state.conflicts, correlation: state.correlation, centered_correlation: state.centered_correlation,
+    advice: await evolve.dartComponent('dart-advisor', { events: state.events, cases: state.cases }),
+    programs: state.entries.map(({ id, family, source, effects, channels, regression: guard, raw }) => ({
+      id, family, source, ...effects, original_score: channels.original_score, relative: channels.relative,
+      cvar: channels.cvar, legal_rate: channels.legal_rate, protected: guard.allowed,
+      judges: raw.map(item => item.judge),
+    })),
+  })
+  const adaptive = await Promise.all(state.events.filter(event => event.arm === 'adaptive').map(async event => {
+    const entry = state.byId.get(event.id)
+    const validated = await readJson(files, recordFor(event.id, 'validation'))
+    return { id: event.id, donor: event.references, router: event.router, gain: event.delta,
+      code_changed: event.patch.added.length + event.patch.removed.length > 0,
+      search_legal: entry?.channels.legal_rate === 1,
+      validation_legal: accepted(validated, evolve.currentRun().dart.protocol.validationSeeds),
+      documented: Boolean(event.router?.router && event.router?.fallback && event.router?.budget) }
+  }))
+  await writeJson(files, 'dart/adaptive.json', adaptive)
+  await writeJson(files, 'dart/responses.json', state.events.map(({ id, parent, delta, reward, normalizer }) =>
+    ({ id, parent, delta, reward, normalizer })))
   const champion = await readJson(files, CHAMPION)
   const { budget } = await evolve.context()
   const seedBudget = await readJson(files, 'dart/budget.json')
-  const seedRemaining = evolve.currentRun().dart.protocol.maxSeeds - (seedBudget?.used ?? 0)
-  return { ...result, best_id: champion.id, best_fitness: champion.fitness, remaining: budget.remaining,
-    champion_certified: champion.certified, seed_remaining: seedRemaining }
+  return { ...result, best_id: champion.id, best_fitness: champion.fitness, submission_id: submission,
+    champion_certified: champion.certified, remaining: budget.remaining,
+    seed_remaining: evolve.currentRun().dart.protocol.maxSeeds - seedBudget.used }
 }
 
+function submissionOrder({ pool, selected }) {
+  const metric = selected === 'raw' ? entry => entry.channels.original_score :
+    selected === 'relative' ? entry => entry.channels.relative : entry => entry.robust
+  const ordered = [...pool].sort((a, b) => metric(b) - metric(a))
+  const best = ordered[0] && metric(ordered[0])
+  const margin = 0.001 * Math.abs(best ?? 0)
+  const near = ordered.filter(entry => best - metric(entry) <= margin)
+  near.sort((a, b) => a.channels.cvar - b.channels.cvar ||
+    mean(a.raw.map(item => item.seconds ?? 0)) - mean(b.raw.map(item => item.seconds ?? 0)))
+  const selectedIds = new Set(near.map(entry => entry.id))
+  return [...near, ...ordered.filter(entry => !selectedIds.has(entry.id))].map(entry => entry.id)
+}
 
 export const DART_COMPONENTS = Object.freeze({
-  'dart-calibrate': ({ baseline, probes, version }) => calibrate(baseline, probes, version),
+  'dart-calibrate': calibrate,
   'dart-normalize': ({ result, model }) => normalized(result, model),
-  'dart-decompose': ({ vector, model }) => decomposition(vector, model),
-  'dart-cluster': ({ entries, model, incumbent }) => profiles(entries, model, incumbent.vector),
-  'dart-archive': ({ entries, groups }) => archive(entries, groups),
-  'dart-parent': ({ entries, cases }) => lexicase(entries, cases),
-  'dart-arm': ({ events, context, eligible }) => armChoice(events, context, eligible),
+  'dart-decompose': decomposition,
+  'dart-cluster': ({ entries, model, events }) => clusterResponses(events, model.anchor.length),
+  'dart-archive': archives,
+  'dart-parent': input => chooseParent(input),
+  'dart-advisor': ({ events, context }) => advisor(events, context),
+  'dart-arm': armChoice,
   'dart-dispatch': ({ state, selected }, evolve) => dispatch(evolve, state, selected),
-  'dart-rank': ({ entry }) => utility(entry.vector),
+  'dart-rank': ({ entry }) => entry.robust,
+  'dart-submission-order': submissionOrder,
   'dart-promote': () => true,
 })
+

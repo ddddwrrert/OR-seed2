@@ -4,13 +4,6 @@ import { join } from 'node:path'
 
 export const BASE = 'c000000'
 export const DEFAULT_SEEDS = Array.from({ length: 50 }, (_, seed) => seed)
-export const PROBES = [
-  { name: 'greedy', instruction: 'Implement a deterministic construction with a different ordering or tie-breaking heuristic. Keep effort low.' },
-  { name: 'multistart', instruction: 'Implement a bounded multi-start or randomized construction, with a fast feasible incumbent and an early stop.' },
-  { name: 'refinement', instruction: 'Implement an incremental local improvement or lookahead method with a fast feasible fallback.' },
-]
-export const BUDGETS = [0.5, 1]
-
 export async function readJson(files, path) {
   const value = await files.read(path)
   return value === undefined ? undefined : JSON.parse(value)
@@ -47,25 +40,6 @@ export async function taskConfig(task) {
 }
 
 export async function protocolFor(task, settings, maxBudget) {
-  const programs = settings.dart.probe_programs ?? {}
-  const recipeCount = Object.keys(programs).length
-  if ((recipeCount !== 0 && recipeCount !== PROBES.length) ||
-      new Set(Object.values(programs)).size !== recipeCount ||
-      !Object.entries(programs).every(([name, file]) => PROBES.some(probe => probe.name === name) &&
-        typeof file === 'string' && /^[a-zA-Z0-9_.-]+\.cpp$/.test(file))) {
-    throw new Error('DART probe_programs must map all three recipes to distinct .cpp files inside evaluator/')
-  }
-  if (recipeCount) {
-    const sources = await Promise.all(Object.values(programs).map(async program => {
-      try {
-        return hash([await readFile(join(task, 'evaluator', program))])
-      } catch (error) {
-        if (error.code !== 'ENOENT') throw error
-        throw new Error(`DART fixed probe is missing: ${program}`, { cause: error })
-      }
-    }))
-    if (new Set(sources).size !== recipeCount) throw new Error('DART fixed probes must have distinct source')
-  }
   const seeds = settings.dart.seeds ?? DEFAULT_SEEDS
   const validationSeeds = settings.dart.validation_seeds ?? [50, 51, 52, 53, 54, 55, 56, 57, 58, 59]
   const allSeeds = [...seeds, ...validationSeeds]
@@ -73,28 +47,59 @@ export async function protocolFor(task, settings, maxBudget) {
       !allSeeds.every(seed => Number.isSafeInteger(seed) && seed >= 0)) {
     throw new Error('DART requires distinct, disjoint search and validation seed lists')
   }
+  const options = settings.dart
+  for (const [seed, bound] of Object.entries(options.quality_reference ?? {})) {
+    if (!seeds.includes(Number(seed)) || !Number.isFinite(bound.lower) || !Number.isFinite(bound.upper) ||
+        bound.upper <= bound.lower || !Number.isFinite(bound.seconds) || bound.seconds <= 0 ||
+        typeof bound.source !== 'string' || !bound.source.trim()) {
+      throw new Error('DART quality reference requires an in-panel seed, documented oriented bounds and a positive time cap')
+    }
+  }
+  if (options.score_unit !== undefined && (!Number.isFinite(options.score_unit) || options.score_unit <= 0)) {
+    throw new Error('DART score_unit must be a positive scoring unit')
+  }
+  if (options.min_reference_programs !== undefined &&
+      (!Number.isSafeInteger(options.min_reference_programs) || options.min_reference_programs < 2)) {
+    throw new Error('DART min_reference_programs must be at least two')
+  }
+  if (options.submission_objective !== undefined && !['raw', 'relative', 'robust'].includes(options.submission_objective)) {
+    throw new Error('DART submission_objective must be raw, relative or robust')
+  }
+  if (options.parent_pool_size !== undefined && (!Number.isSafeInteger(options.parent_pool_size) || options.parent_pool_size < 2)) {
+    throw new Error('DART parent_pool_size must be at least two')
+  }
   const maxSeeds = settings.dart.max_seed_calls ??
-    (1 + maxBudget + PROBES.length + 1) * (seeds.length + validationSeeds.length)
+    (1 + maxBudget) * (seeds.length + validationSeeds.length)
   if (!Number.isSafeInteger(maxSeeds) || maxSeeds < seeds.length + validationSeeds.length) {
     throw new Error('DART max_seed_calls must cover both panels for the baseline')
   }
   const version = hash([
-    'dart-evaluator-v2', JSON.stringify(settings), JSON.stringify({ seeds, validationSeeds, maxSeeds }),
+    'dart-organon-v4', JSON.stringify(settings), JSON.stringify({ seeds, validationSeeds, maxSeeds }),
     ...await evaluatorFiles(join(task, 'evaluator')),
   ])
   return { seeds, validationSeeds, maxSeeds, version }
 }
 
+const reservationQueues = new Map()
 export async function reserve(evolve, count, purpose) {
   const files = evolve.files
   const { maxSeeds } = evolve.currentRun().dart.protocol
-  const budget = await readJson(files, 'dart/budget.json') ?? { used: 0, reservations: [] }
-  if (budget.used + count > maxSeeds) {
-    throw Object.assign(new Error('DART seed evaluation budget exhausted'), { code: 'DART_BUDGET' })
+  const previous = reservationQueues.get(files.root) ?? Promise.resolve()
+  const queued = previous.catch(() => {}).then(async () => {
+    const budget = await readJson(files, 'dart/budget.json') ?? { used: 0, reservations: [] }
+    if (budget.used + count > maxSeeds) {
+      throw Object.assign(new Error('DART seed evaluation budget exhausted'), { code: 'DART_BUDGET' })
+    }
+    budget.used += count
+    budget.reservations.push({ count, purpose, at: new Date().toISOString() })
+    await writeJson(files, 'dart/budget.json', budget)
+  })
+  reservationQueues.set(files.root, queued)
+  try {
+    await queued
+  } finally {
+    if (reservationQueues.get(files.root) === queued) reservationQueues.delete(files.root)
   }
-  budget.used += count
-  budget.reservations.push({ count, purpose, at: new Date().toISOString() })
-  await writeJson(files, 'dart/budget.json', budget)
 }
 
 export function usable(result, seeds) {

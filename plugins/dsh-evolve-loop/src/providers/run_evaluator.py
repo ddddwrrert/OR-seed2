@@ -101,8 +101,11 @@ def main() -> None:
     function = load_evaluate(task / "evaluator" / "evaluator.py")
     code = b"\n".join(line for line in program.read_bytes().split(b"\n")
                       if line.strip() not in MARKERS)
-    retries = 0 if os.environ.get("OR_SINGLE_ATTEMPT") == "1" else settings["max_retries"]
+    dart = os.environ.get("OR_SINGLE_ATTEMPT") == "1"
+    retries = 0 if dart else settings["max_retries"]
     metrics = evaluate(function, code, program.suffix, settings["timeout"], retries)
+    if dart and "error" in metrics and "seed_results" not in metrics:
+        metrics.setdefault("evaluation_failure", "TIME_LIMIT_EXCEEDED" if metrics.get("timeout") else "EVALUATOR_ERROR")
     result_stream.write(json.dumps({"fitness": get_score(metrics), "metrics": metrics}, default=str) + "\n")
     result_stream.flush()
 

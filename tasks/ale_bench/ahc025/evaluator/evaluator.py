@@ -52,11 +52,9 @@ def evaluate(program_path):
         logger.info("Code extracted")
         num_public_cases = 50
         seeds = json.loads(os.environ.get("OR_SEEDS", json.dumps(list(range(num_public_cases)))))
-        fraction = float(os.environ.get("OR_BUDGET_FRACTION", "1"))
         cases = session.case_gen(seeds)
         public_result = session.case_eval(
             cases, code, code_language="cpp20", skip_local_visualization=True,
-            time_limit=session.problem.constraints.time_limit * fraction if fraction != 1 else None,
         )
         logger.info("Public evaluation completed")
         extracted_case = result_feedback(public_result)
@@ -89,7 +87,6 @@ def evaluate(program_path):
         return {
             "seed_results": seed_results,
             "score_direction": "maximize" if optim_factor == 1 else "minimize",
-            "budget_fraction": fraction,
             "resource_usage": public_result.resource_usage.model_dump(),
             "judge_result": public_result.overall_judge_result.value,
             "overall_score": public_result.overall_absolute_score,

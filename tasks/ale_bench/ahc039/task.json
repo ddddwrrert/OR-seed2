@@ -5,10 +5,7 @@
   "sandbox": false,
   "dart": {
     "enabled": true,
-    "probe_programs": {
-      "greedy": "probe_greedy.cpp",
-      "multistart": "probe_multistart.cpp",
-      "refinement": "probe_refinement.cpp"
-    }
+    "submission_objective": "raw",
+    "score_unit": 1
   }
 }

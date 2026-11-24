@@ -4,6 +4,8 @@
   "max_retries": 3,
   "sandbox": false,
   "dart": {
-    "enabled": true
+    "enabled": true,
+    "submission_objective": "raw",
+    "score_unit": 1
   }
 }

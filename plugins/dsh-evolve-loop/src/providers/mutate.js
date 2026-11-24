@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Default mutate / variation provider: allocates candidate directory and spawns a worker subagent.
  * Accepts per-worker instruction, name, persona, model, and tool settings.
  *
@@ -72,7 +72,8 @@ export async function mutate(options, evolve) {
     arm: _arm,
     context: _context,
     focus: _focus,
-    ablationOf: _ablationOf,
+    attributionOf: _attributionOf,
+    parent_mode: _parentMode,
     ...extra
   } = options ?? {}
 

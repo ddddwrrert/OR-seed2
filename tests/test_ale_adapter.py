@@ -25,7 +25,7 @@ class AleAdapterTest(unittest.TestCase):
                     def case_eval(instances, code, **options):
                         self.assertEqual(instances, ["instance 9", "instance 3"])
                         self.assertEqual(code, "int main() {}")
-                        self.assertEqual(options["time_limit"], 1.0)
+                        self.assertNotIn("time_limit", options)
                         cases = [SimpleNamespace(
                             absolute_score=score, judge_result=ACCEPTED, execution_time=0.25,
                             memory_usage=1024, output_str="out", error_str="stderr", message="judge",
@@ -52,7 +52,7 @@ class AleAdapterTest(unittest.TestCase):
                 program = Path(scratch) / "solution.cpp"
                 program.write_text("int main() {}")
                 with patch.dict("sys.modules", {ale.__name__: ale, safe.__name__: safe}), patch.dict(os.environ, {
-                    "OR_SEEDS": "[9, 3]", "OR_BUDGET_FRACTION": "0.5", "OR_TRACE_FILE": str(trace),
+                    "OR_SEEDS": "[9, 3]", "OR_TRACE_FILE": str(trace),
                 }):
                     spec = importlib.util.spec_from_file_location(task.name, task / "evaluator/evaluator.py")
                     adapter = importlib.util.module_from_spec(spec)

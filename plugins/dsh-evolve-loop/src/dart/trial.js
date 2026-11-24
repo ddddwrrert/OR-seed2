@@ -3,7 +3,7 @@ import { join } from 'node:path'
 import { BUDGET_FILE, budgetStatus } from '../budget.js'
 import { candidatePath } from '../candidates.js'
 import { filesOf } from '../files.js'
-import { cvar, normalized } from './model.js'
+import { acceptedCase, evaluateChannels, mean } from './model.js'
 import { readJson, writeJson } from './store.js'
 
 const CHAMPION = 'dart/champion.json'
@@ -19,6 +19,7 @@ async function runArm({ name, root, directory, args, run, before, seedBudget, se
   for (const entry of await readdir(join(root, 'dart'))) {
     if (entry !== 'trials') await cp(join(root, 'dart', entry), join(trialRoot, 'dart', entry), { recursive: true })
   }
+  const priorEvents = (await filesOf(trialRoot).read('dart/mutations.jsonl') ?? '').split('\n').filter(Boolean).length
   let summary
   let error
   try {
@@ -29,7 +30,7 @@ async function runArm({ name, root, directory, args, run, before, seedBudget, se
   }
   const files = filesOf(trialRoot)
   return {
-    files, summary, error,
+    files, summary, error, priorEvents,
     champion: await readJson(files, CHAMPION),
     attempts: (await budgetStatus(trialRoot, before.max)).used - before.used,
     seedCalls: (await readJson(files, SEED_BUDGET)).used - seedBudget.used,
@@ -37,14 +38,49 @@ async function runArm({ name, root, directory, args, run, before, seedBudget, se
 }
 
 async function comparison(control, treatment, old, model) {
+  const arms = [control, treatment]
+  const histories = await Promise.all(arms.map(async arm => {
+    const rows = (await arm.files.read('dart/mutations.jsonl') ?? '').split('\n').filter(Boolean).map(JSON.parse)
+    return rows.slice(arm.priorEvents)
+  }))
+  const initial = await readJson(control.files, `evals/${old.id}.json`)
+  const champions = await Promise.all(arms.map(arm => readJson(arm.files, `evals/${arm.champion.id}.json`)))
+  const panels = await Promise.all(histories.map((events, index) => Promise.all(events.map(event =>
+    readJson(arms[index].files, `evals/${event.id}.json`)))))
+  const shared = { ...model, anchor: model.anchor.map((anchor, index) => {
+    const candidates = [...champions, ...panels.flat()].map(result => result?.metrics?.seed_results?.[index]).filter(acceptedCase)
+    const values = [anchor.localBest, ...candidates.map(item => item.score)].filter(value => value !== null)
+    return { ...anchor, localBest: model.direction * Math.max(...values.map(value => value * model.direction)) }
+  }) }
+  const metrics = arms.map((arm, index) => {
+    const raw = champions[index].metrics.seed_results
+    const channel = evaluateChannels({ raw, fitness: arm.champion.fitness }, shared)
+    const cost = arm.seedCalls + histories[index].reduce((sum, event) => sum + (event.elapsed_ms ?? 0) / 1000, 0)
+    const basis = initial.fitness
+    const oldIds = new Set(histories[index].map(event => event.id))
+    return {
+      original_gain: channel.original_score - basis,
+      gain_per_budget: (channel.original_score - basis) / Math.max(1, cost),
+      exceptional_seeds: model.anchor.filter((anchor, seed) => panels[index].some(result => {
+        const item = result?.metrics?.seed_results?.[seed]
+        return acceptedCase(item) && (anchor.localBest === null ||
+          model.direction * (item.score - anchor.localBest) > 0)
+      })).length,
+      legal_rate: mean(panels[index].map(result => Number(result?.metrics?.seed_results?.every(acceptedCase) ?? false))),
+      tail_gap: channel.cvar,
+      descendant_gain: histories[index].filter(event => oldIds.has(event.parent)).reduce((sum, event) =>
+        sum + Math.max(0, event.reward ?? 0), 0),
+      evaluation_wall_seconds: histories[index].reduce((sum, event) => sum + (event.elapsed_ms ?? 0) / 1000, 0),
+    }
+  })
+  const [a, b] = metrics
   const winner = treatment.champion
-  if (!treatment.summary || !control.summary || !winner?.certified || winner.id === old.id ||
-      treatment.summary.best_id !== winner.id || !control.champion?.certified ||
-      treatment.attempts <= 0 || treatment.attempts !== control.attempts) return false
-  if (!(winner.fitness > control.champion.fitness && winner.fitness > old.fitness)) return false
-  const controlEvidence = await readJson(control.files, `evals/${control.champion.id}.json`)
-  const treatmentEvidence = await readJson(treatment.files, `evals/${winner.id}.json`)
-  return cvar(normalized(treatmentEvidence, model)) >= cvar(normalized(controlEvidence, model))
+  const passed = treatment.summary && control.summary && winner?.certified && winner.id !== old.id &&
+    treatment.summary.best_id === winner.id && control.champion?.certified &&
+    treatment.attempts > 0 && treatment.attempts === control.attempts &&
+    b.original_gain > Math.max(0, a.original_gain) && b.gain_per_budget >= a.gain_per_budget &&
+    b.legal_rate >= a.legal_rate && b.tail_gap <= a.tail_gap
+  return { passed: Boolean(passed), metrics }
 }
 
 async function mergeChampion(files, treatment) {
@@ -106,6 +142,7 @@ export async function runStrategyTrial({ trial, args, files, run, rollback, acti
   let control
   let treatment
   let passed = false
+  let assessments
   let failure
   try {
     await rollback()
@@ -117,7 +154,11 @@ export async function runStrategyTrial({ trial, args, files, run, rollback, acti
       control = await runArm({ ...common, name: 'control' })
       if (!control.error) treatment = await runArm({ ...common, name: 'treatment', activate })
       failure = control.error ?? treatment?.error
-      passed = !failure && Boolean(treatment) && await comparison(control, treatment, old, model)
+      if (!failure && treatment) {
+        const assessed = await comparison(control, treatment, old, model)
+        passed = assessed.passed
+        assessments = assessed.metrics
+      }
     }
   } catch (error) {
     failure = error
@@ -152,6 +193,7 @@ export async function runStrategyTrial({ trial, args, files, run, rollback, acti
     control_champion: control?.champion?.id, candidate_limit_per_arm: candidates, seed_limit_per_arm: seedAllowance,
     control: control && { attempts: control.attempts, seed_calls: control.seedCalls, fitness: control.champion?.fitness },
     treatment: treatment && { attempts: treatment.attempts, seed_calls: treatment.seedCalls, fitness: treatment.champion?.fitness },
+    assessment: assessments && { control: assessments[0], treatment: assessments[1] },
     evidence_directory: directory,
     reason: failure?.message ?? (passed ? 'certified improvement over matched control' :
       treatment ? 'no certified improvement over matched control' : 'insufficient paired trial budget or uncertified baseline'),

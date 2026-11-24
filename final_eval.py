@@ -1,18 +1,7 @@
-"""Final score of a finished ALE-Bench run: the private evaluation of its best candidate.
-
-    <benchmark python> final_eval.py <task folder>
-
-As with EvoX, the private evaluation (private_eval.py, next to this script, on the
-hidden test cases) runs once the search is over, on the best candidate in
-run/population.jsonl, chosen as the evolve loop chooses it. The search never sees these
-scores. Our #EVOLVE_START/#EVOLVE_END lines are removed from the program first.
-The output of private_eval.py is saved to run/final.txt.
-
-Only ALE-Bench tasks have a separate final evaluation; for the others the
-recorded fitness is the final score.
-"""
+"""Export the locally validated V4 submission. Legacy tasks retain their original final evaluation."""
 
 import json
+import hashlib
 import subprocess
 import sys
 import tempfile
@@ -27,16 +16,40 @@ def merit(fitness: float) -> float:
     return fitness if fitness > 0 else -1 / fitness if fitness < 0 else 0.0
 
 
+def export_dart(task: Path, settings: dict) -> None:
+    run = task / "run"
+    selection = json.loads((run / "dart/submission.json").read_text(encoding="utf-8"))
+    candidate_id = selection["id"]
+    if len(candidate_id) != 7 or not candidate_id.startswith("c") or not candidate_id[1:].isdigit():
+        raise SystemExit("Invalid DART candidate ID")
+    program = run / "candidates" / candidate_id / settings["program"]
+    source = program.read_bytes()
+    digest = hashlib.sha256(str(len(source)).encode() + b":" + source).hexdigest()
+    if digest != selection["source_sha256"] or selection["validation"] != "LEGAL":
+        raise SystemExit("DART selection does not match locally validated source")
+    output = run / ("final-solution" + program.suffix)
+    code = b"\n".join(line for line in source.split(b"\n") if line.strip() not in MARKERS)
+    with tempfile.NamedTemporaryFile(dir=run, delete=False) as handle:
+        temporary = Path(handle.name)
+        handle.write(code)
+    try:
+        temporary.replace(output)
+    finally:
+        temporary.unlink(missing_ok=True)
+    report = dict(selection, output=output.name)
+    (run / "final.txt").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(f"Exported locally validated {candidate_id} ({selection['objective']}) to {output}")
+
+
 def main() -> None:
     task = Path(sys.argv[1]).resolve()
     private_eval = Path(__file__).resolve().parent / "private_eval.py"
     settings = json.loads((task / "task.json").read_text(encoding="utf-8"))
+    if settings.get("dart", {}).get("enabled"):
+        export_dart(task, settings)
+        return
     lines = (task / "run" / "population.jsonl").read_text(encoding="utf-8").splitlines()
     best = max((json.loads(line) for line in lines if line.strip()), key=lambda row: merit(row["fitness"]))
-    if settings.get("dart", {}).get("enabled"):
-        best = json.loads((task / "run" / "dart" / "champion.json").read_text(encoding="utf-8"))
-        if not best["certified"]:
-            raise SystemExit("DART has no certified champion for private evaluation")
     program = task / "run" / "candidates" / best["id"] / settings["program"]
     code = b"\n".join(line for line in program.read_bytes().split(b"\n") if line.strip() not in MARKERS)
 

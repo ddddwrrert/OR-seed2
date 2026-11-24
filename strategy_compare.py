@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import json
+import math
 import shutil
 from pathlib import Path
 
@@ -17,16 +18,11 @@ def state(task):
     champion = read(run / "dart/champion.json")
     candidate_dirs = run / "candidates"
     evaluations = read(run / "evals" / f"{champion['id']}.json")["metrics"]["seed_results"]
-    values = [
-        (model["direction"] * case["score"] - anchor["low"]) / anchor["scale"]
-        if case["judge"] == "ACCEPTED" else -2
-        for anchor, case in zip(model["anchor"], evaluations, strict=True)
-    ]
-    tail = sorted(values)[: (len(values) + 4) // 5]
     budget = read(run / "budget.json")
     return {
         "protocol": read(run / "dart/protocol.json")["version"],
-        "model": model["version"],
+        "model": model,
+        "panel": evaluations,
         "candidate_cap": budget["max"],
         "candidates": budget.get("trial_attempts", 0) + sum(
             p.is_dir() and p.name != "c000000" and p.name[1:].isdigit()
@@ -34,7 +30,6 @@ def state(task):
         ),
         "seed_calls": read(run / "dart/budget.json")["used"],
         "champion": champion,
-        "cvar": sum(tail) / len(tail),
     }
 
 
@@ -61,21 +56,53 @@ def fork(task, experiment):
             "treatment": str(experiment / "treatment" / target_name)}
 
 
+def tail_gap(panel, model, best):
+    direction = model["direction"]
+    losses = []
+    for case, anchor, reference in zip(panel, model["anchor"], best, strict=True):
+        if case["judge"] != "ACCEPTED" or reference is None:
+            losses.append(1.0)
+            continue
+        score = case["score"]
+        if anchor["mode"] == "log" and min(score, reference) > 0:
+            difference = direction * (math.log(reference) - math.log(score))
+        else:
+            difference = direction * (reference - score) / anchor["scale"]
+        losses.append(max(0.0, difference))
+    mass = len(losses) * 0.2
+    whole = int(mass)
+    ordered = sorted(losses, reverse=True)
+    cutoff = ordered[whole] if whole < len(ordered) else 0
+    return (sum(ordered[:whole]) + (mass - whole) * cutoff) / mass
+
+
 def compare(experiment):
     manifest = read(experiment / "strategy-comparison.json")
     before = manifest["baseline"]
-    arms = {}
-    for arm in ("control", "treatment"):
-        after = state(experiment / arm / manifest["task"])
-        if any(after[field] != before[field] for field in ("protocol", "model", "candidate_cap")):
-            raise ValueError(f"{arm} used a different evaluation protocol, anchor model, or candidate cap")
-        arms[arm] = {
+    snapshots = {arm: state(experiment / arm / manifest["task"]) for arm in ("control", "treatment")}
+    model = before["model"]
+    direction = model["direction"]
+    for arm, after in snapshots.items():
+        if any(after[field] != before[field] for field in ("protocol", "candidate_cap")):
+            raise ValueError(f"{arm} used a different evaluation protocol or candidate cap")
+    best = []
+    for index, anchor in enumerate(model["anchor"]):
+        candidates = [anchor["localBest"]]
+        for state_at_end in snapshots.values():
+            observed = state_at_end["model"]["anchor"][index]["localBest"]
+            candidates.append(observed)
+        best.append(max((value for value in candidates if value is not None),
+                        key=lambda value: direction * value, default=None))
+    before_gap = tail_gap(before["panel"], model, best)
+    arms = {
+        arm: {
             "candidates": after["candidates"] - before["candidates"],
             "seed_calls": after["seed_calls"] - before["seed_calls"],
             "champion": after["champion"],
             "fitness_gain": after["champion"]["fitness"] - before["champion"]["fitness"],
-            "cvar_gain": after["cvar"] - before["cvar"],
-        }
+            "cvar_gain": before_gap - tail_gap(after["panel"], model, best),
+        } for arm, after in snapshots.items()
+    }
     control, treatment = arms["control"], arms["treatment"]
     matched = control["candidates"] == treatment["candidates"] and control["candidates"] > 0
     return {

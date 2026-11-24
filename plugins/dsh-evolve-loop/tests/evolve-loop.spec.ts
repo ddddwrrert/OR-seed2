@@ -1,3 +1,5 @@
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
 ﻿import { cp, mkdir, mkdtemp, readFile, realpath, writeFile, readdir } from 'node:fs/promises'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -18,7 +20,7 @@ let evolve: any
 let agent: any
 let hasProvider: boolean
 let starts: { request: any, order: string[] }[]
-let worker: (request: any) => Promise<void>
+let worker: (request: any) => Promise<void | string>
 
 async function setCandidateValue(dir: string, value: number): Promise<void> {
   const source = await readFile(join(dir, 'solution.py'), 'utf8')
@@ -37,9 +39,9 @@ function subagentsService() {
       const order: string[] = []
       starts.push({ request, order })
       const result = (async () => {
-        await worker(request)
+        const report = await worker(request)
         order.push('result')
-        return { output: [{ type: 'text', text: 'report' }], stopReason: 'completed' }
+        return { output: [{ type: 'text', text: report ?? 'report' }], stopReason: 'completed' }
       })()
       return {
         id: `child-${String(starts.length)}`,
@@ -272,8 +274,8 @@ describe('DART through evolve_run', () => {
   async function setupDart(maxSeedCalls?: number) {
     const path = join(task, 'task.json')
     const config = JSON.parse(await readFile(path, 'utf8'))
-    config.dart = { enabled: true, allow_generated_probes: true, seeds: [0, 1, 2, 3], validation_seeds: [50, 51],
-      max_seed_calls: maxSeedCalls }
+    config.dart = { enabled: true, seeds: [0, 1, 2, 3], validation_seeds: [50, 51],
+      max_seed_calls: maxSeedCalls, worker_weights: { global: 1, hard: 0, repair: 0, exploration: 0, transfer: 0, adaptive: 0, attribution: 0 } }
     await writeFile(path, JSON.stringify(config))
     await cp(join(FIXTURE_TASK, '..', 'dart_evaluator.py'), join(task, 'evaluator', 'evaluator.py'))
   }
@@ -282,20 +284,27 @@ describe('DART through evolve_run', () => {
     return JSON.parse(await readFile(join(task, 'run', relative), 'utf8'))
   }
 
-  it('pins probes across chunks, runs mutation, reuses traces and promotes via held-out evidence', async () => {
+  it('evolves on the first candidate and rescales all history without any calibration workers', async () => {
     await setupDart()
     const first = await runTool({ max_budget: 5, candidates: 2 })
-    expect(first.best_id).toBe('c000000')
+    expect(first.best_id).toBe('c000002')
     expect(first.remaining).toBe(3)
-    expect(starts[0].request.label).toBe('probe-greedy')
+    expect(starts[0].request.label).toBe('dart-global')
+    const previous = await report('dart/model.json')
 
     const second = await runTool({ max_budget: 5, candidates: 2 })
     expect(second.best_id).toBe('c000004')
+    expect(second.submission_id).toBe('c000004')
     expect(second.champion_certified).toBe(true)
-    const calibration = await report('dart/model.json')
-    expect(calibration.panel).toHaveLength(3)
-    expect(calibration.cases[0].observations).toBe(6)
-    expect((await report('dart/evidence/c000001-probe-0.5.json')).metrics.seed_results[0].seconds).toBe(0.05)
+    const model = await report('dart/model.json')
+    expect(model.version).not.toBe(previous.version)
+    const diagnostic = await report('dart/diagnostics.json')
+    expect(diagnostic.cases.every((item: any) => item.difficulty_status === 'UNKNOWN')).toBe(true)
+    expect(diagnostic.programs).toHaveLength(5)
+    const responses = await report('dart/responses.json')
+    expect(responses).toHaveLength(4)
+    expect(responses.every((item: any) => item.normalizer === model.version)).toBe(true)
+    expect((await report('dart/archives.json')).raw[0]).toBe('c000004')
     expect((await report('dart/evidence/c000004-validation-1.json')).metrics.seed_results.map((s: any) => s.seed)).toEqual([50, 51])
     const result = await report('evals/c000004.json')
     expect(result.metrics.seed_results.map((s: any) => s.score)).toEqual([30, 60, 90, 120])
@@ -306,37 +315,96 @@ describe('DART through evolve_run', () => {
     expect(last.best_id).toBe('c000004')
     expect(last.remaining).toBe(0)
     expect((await report('evals/c000005.json')).cache_hit).toBe(true)
-    expect(await report('dart/model.json')).toEqual(calibration)
+    expect((await report('dart/submission.json')).validation).toBe('LEGAL')
   }, 45_000)
 
-  async function configureFixedProbes() {
+  it.runIf(process.env.OR_V4_CXX_E2E === '1')(
+    'compiles a conditional solver, measures 50 plus 10 seeds and exports its source end to end', async () => {
+      await setupDart()
+      const configPath = join(task, 'task.json')
+      const config = JSON.parse(await readFile(configPath, 'utf8'))
+      config.program = 'solution.cpp'
+      config.timeout = 60
+      delete config.dart.seeds
+      delete config.dart.validation_seeds
+      await writeFile(configPath, JSON.stringify(config))
+      const source = '#include <iostream>\n#EVOLVE_START\nint main() { int n; std::cin >> n; std::cout << n * (n % 2 ? 12 : 10); }\n#EVOLVE_END\n'
+      await writeFile(join(task, config.program), source)
+      await cp(join(FIXTURE_TASK, '..', 'dart_cpp_evaluator.py'), join(task, 'evaluator', 'evaluator.py'))
+      worker = async request => {
+        if (request.label === 'dart-adaptive') {
+          expect(await readdir(join(request.confine.root, '.dart-references'))).toHaveLength(1)
+          await writeFile(join(request.confine.root, config.program), source.replace('12 : 10', '12 : 14'))
+          return 'Mechanism: parity routing\nRouter: n parity\nFallback: original construction\nBudget: one arithmetic operation'
+        }
+        await writeFile(join(request.confine.root, config.program), source.replace('12 : 10', '10 : 14'))
+        return 'Mechanism: even-case improvement'
+      }
+      const select = evolve.register('select', { name: 'baseline-parent', select: async () => 'c000000' })
+      let arm = 'global'
+      const dispatch = evolve.register('dart-arm', { name: 'choose-adaptive', run: () => arm })
+      let response
+      try {
+        await runTool({ max_budget: 3, candidates: 1 })
+        arm = 'adaptive'
+        response = await runTool({ max_budget: 3, candidates: 1 })
+      } finally {
+        select()
+        dispatch()
+      }
+      expect(response).toMatchObject({ best_id: 'c000002', submission_id: 'c000002', champion_certified: true })
+      const search = await report('evals/c000002.json')
+      expect(search.metrics.seed_results.map((item: any) => item.seed)).toEqual(Array.from({ length: 50 }, (_, i) => i))
+      expect(search.metrics.seed_results[0].score).toBe(12)
+      expect(search.metrics.seed_results[49].score).toBe(700)
+      expect((await report('dart/evidence/c000002-validation-1.json')).metrics.seed_results).toHaveLength(10)
+      expect(await report('dart/adaptive.json')).toContainEqual(expect.objectContaining({
+        id: 'c000002', documented: true, code_changed: true, search_legal: true, validation_legal: true,
+      }))
+      const finalizer = fileURLToPath(new URL('../../../final_eval.py', import.meta.url))
+      const { stdout } = await promisify(execFile)('python', ['-B', finalizer, task])
+      expect(stdout).toContain('Exported locally validated c000002')
+      expect(await readFile(join(task, 'run', 'final-solution.cpp'), 'utf8')).toContain('12 : 14')
+      expect(await readFile(join(task, 'run', 'final-solution.cpp'), 'utf8')).not.toContain('#EVOLVE')
+    }, 120_000,
+  )
+
+  it('passes donor code and paired patch evidence through the seven worker workflows', async () => {
     await setupDart()
-    const programs = { greedy: 'greedy.cpp', multistart: 'multistart.cpp', refinement: 'refinement.cpp' }
     const path = join(task, 'task.json')
     const config = JSON.parse(await readFile(path, 'utf8'))
-    config.dart.probe_programs = programs
-    delete config.dart.allow_generated_probes
+    config.env = { OR_TEST_CONFLICT: '1' }
     await writeFile(path, JSON.stringify(config))
-    return Object.values(programs)
-  }
-
-  it('calibrates from authored probe files without calling a worker', async () => {
-    const programs = await configureFixedProbes()
-    for (const [index, program] of programs.entries()) {
-      await writeFile(join(task, 'evaluator', program), `VALUE = ${15 + index}\n`)
+    let arm = 'global'
+    const override = evolve.register('dart-arm', { name: 'test-worker', run: () => arm })
+    const select = evolve.register('select', { name: 'test-parent', select: async () => 'c000000' })
+    const labels = ['global', 'hard', 'repair', 'transfer', 'adaptive', 'attribution', 'exploration']
+    let donorUsed = false
+    worker = async req => {
+      if (arm === 'transfer' || arm === 'adaptive') {
+        const files = await readdir(join(req.confine.root, '.dart-references'))
+        expect(files.length).toBeGreaterThan(0)
+        donorUsed = true
+      }
+      await setCandidateValue(req.confine.root, arm === 'attribution' ? 10 : 15 + 5 * labels.indexOf(arm))
+      return `Mechanism: ${arm}\nRouter: size threshold\nFallback: feasible start\nBudget: shared deadline`
     }
-    await runTool({ max_budget: 6, candidates: 3 })
-    const model = await report('dart/model.json')
-    expect(model.calibration_status).toBe('fixed')
-    expect(model.cases[0]).toMatchObject({ full_observations: 3, budget_pairs: 3 })
-    expect(starts).toHaveLength(0)
-  }, 45_000)
-
-  it('rejects an incomplete fixed probe panel before spending a candidate', async () => {
-    await configureFixedProbes()
-    await expect(runTool({ max_budget: 6, candidates: 3 })).rejects.toThrow('fixed probe is missing')
-    expect(starts).toHaveLength(0)
-  })
+    try {
+      for (const label of labels) {
+        arm = label
+        await runTool({ max_budget: 8, candidates: 1 })
+      }
+    } finally {
+      select()
+      override()
+    }
+    expect(donorUsed).toBe(true)
+    expect(starts.map(item => item.request.label)).toEqual(labels.map(label => `dart-${label}`))
+    const mechanisms = await report('dart/mechanisms.json')
+    expect(mechanisms.some((item: any) => item.status === 'PAIRED' && item.ablation)).toBe(true)
+    const routes = await report('dart/adaptive.json')
+    expect(routes).toContainEqual(expect.objectContaining({ documented: true, search_legal: true, code_changed: true }))
+  }, 60_000)
 
   it('does not spend a candidate when case budget is exhausted by the baseline', async () => {
     await setupDart(6)
@@ -365,6 +433,7 @@ describe('DART through evolve_run', () => {
     worker = async req => setCandidateValue(req.confine.root, 10)
     const run = join(task, 'run')
     const before = await readFile(join(run, 'population.jsonl'), 'utf8')
+    const beforeEvents = await readFile(join(run, 'dart', 'mutations.jsonl'), 'utf8')
     const trial = await runTool({ max_budget: 7, candidates: 4 })
     expect(trial.dart_trial.status).toBe('rolled_back')
     expect(trial.dart_trial).toMatchObject({
@@ -372,7 +441,7 @@ describe('DART through evolve_run', () => {
     })
     expect(trial.remaining).toBe(0)
     expect(await readFile(join(run, 'population.jsonl'), 'utf8')).toBe(before)
-    await expect(readFile(join(run, 'dart', 'mutations.jsonl'), 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
+    await expect(readFile(join(run, 'dart', 'mutations.jsonl'), 'utf8')).resolves.toBe(beforeEvents)
     expect(evolve.getProvider('select').name).toBe('fitness-proportional')
   }, 45_000)
 
@@ -386,13 +455,13 @@ describe('DART through evolve_run', () => {
       name: 'winning-arm', purpose: 'choose the higher scoring fixture worker', host_code: `
         return { name: 'winning-arm', inject: ['evolve'], apply(ctx) {
           ctx.effect(() => ctx.evolve.register('dart-arm', {
-            name: 'winning-arm', run() { return 'generalize' }
+            name: 'winning-arm', run() { return 'exploration' }
           }))
         } }
       `,
     })
     await invoke('evolve_activate', { plugin_id: defined.plugin_id })
-    worker = async req => setCandidateValue(req.confine.root, req.label === 'dart-generalize' ? 55 : 10)
+    worker = async req => setCandidateValue(req.confine.root, req.label === 'dart-exploration' ? 55 : 10)
     const response = await runTool({ max_budget: 8, candidates: 1 })
     expect(response.dart_trial.status).toBe('validated')
     expect(response.best_id).toBe('c000004')
@@ -400,7 +469,7 @@ describe('DART through evolve_run', () => {
     expect(evolve.getProvider('dart-arm').name).toBe('winning-arm')
     const population = await readFile(join(task, 'run', 'population.jsonl'), 'utf8')
     expect(population).toContain('"trial_parent"')
-    await expect(readFile(join(task, 'run', 'dart', 'mutations.jsonl'), 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
+    expect((await readFile(join(task, 'run', 'dart', 'mutations.jsonl'), 'utf8')).trim().split('\n')).toHaveLength(3)
   }, 45_000)
 
   it('runs an independent DART component provided by a dynamic plugin and restores the default', async () => {
@@ -410,27 +479,27 @@ describe('DART through evolve_run', () => {
       agent, callId: name, name, signal: new AbortController().signal,
     } as never)
     const defined: any = await invoke('evolve_define', {
-      name: 'generalize-arm', purpose: 'validate standalone dispatch component',
+      name: 'exploration-arm', purpose: 'validate standalone dispatch component',
       host_code: `
-        return { name: 'generalize-arm', inject: ['evolve'], apply(ctx) {
+        return { name: 'exploration-arm', inject: ['evolve'], apply(ctx) {
           ctx.effect(() => ctx.evolve.register('dart-arm', {
-            name: 'generalize-only',
+            name: 'exploration-only',
             async run({ eligible }, evolve) {
               const fallback = await evolve.dartComponent('dart-arm', {
                 eligible, events: [], context: 'default',
               }, { defaultProvider: true })
-              return eligible.includes('generalize') ? 'generalize' : fallback
+              return 'exploration'
             }
           }))
         } }
       `,
     })
     expect(await invoke('evolve_activate', { plugin_id: defined.plugin_id })).toMatchObject({
-      ok: true, dart_trial: 'pending', changed: { 'dart-arm': { after: ['default', 'generalize-only'] } },
+      ok: true, dart_trial: 'pending', changed: { 'dart-arm': { after: ['default', 'exploration-only'] } },
     })
     worker = async req => setCandidateValue(req.confine.root, 10)
     const output = await runTool({ max_budget: 8, candidates: 1 })
-    expect(starts.at(-1)?.request.label).toBe('dart-generalize')
+    expect(starts.at(-1)?.request.label).toBe('dart-exploration')
     expect(output.dart_trial.status).toBe('rolled_back')
     expect(evolve.getProvider('dart-arm').name).toBe('default')
   }, 45_000)
@@ -458,6 +527,28 @@ describe('DART through evolve_run', () => {
     expect(await readFile(population, 'utf8')).toBe(before)
     const budget = await report('budget.json')
     expect(budget.trial_attempts).toBe(1)
+  }, 45_000)
+
+  it('protects canonical budget and score files while permitting Provider evaluation composition', async () => {
+    await setupDart()
+    let attempts = 0
+    const restore = evolve.register('evaluate', {
+      name: 'composed-evaluator',
+      async evaluate(candidate: any, service: any) {
+        await expect(service.files.write('dart/budget.json', '{"used":0}')).rejects.toThrow('host-managed')
+        await expect(service.files.write(`evals/${candidate.id}.json`, '{}')).rejects.toThrow('host-managed')
+        await service.files.write('strategy-notes.json', '{}')
+        attempts++
+        return service.evaluate(candidate, { defaultProvider: true })
+      },
+    })
+    try {
+      await runTool({ max_budget: 6, candidates: 1 })
+    } finally {
+      restore()
+    }
+    expect(attempts).toBe(2)
+    expect((await report('dart/budget.json')).used).toBe(12)
   }, 45_000)
 
   it('hard-caps candidate allocation even when a trial loop ignores the requested limit', async () => {
@@ -493,7 +584,7 @@ describe('DART through evolve_run', () => {
     const decisions = (await readFile(join(task, 'run', 'dart', 'promotions.jsonl'), 'utf8'))
       .trim().split('\n').map(line => JSON.parse(line))
     expect(decisions).toContainEqual(expect.objectContaining({
-      challenger: 'c000004', certified: false, reason: 'fixed raw easy-case floor',
+      challenger: 'c000004', certified: false, reason: 'fixed long-term regression guard',
     }))
   }, 45_000)
 

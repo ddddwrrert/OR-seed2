@@ -1,147 +1,123 @@
-export const mean = values => values.reduce((sum, value) => sum + value, 0) / values.length
-export const median = values => {
+export const mean = values => values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : 0
+export const clamp = (value, low = 0, high = 1) => Math.min(high, Math.max(low, value))
+export const acceptedCase = item => item?.judge === 'ACCEPTED' && Number.isFinite(item.score)
+export const directionOf = result => result.metrics.score_direction === 'maximize' ? 1 : -1
+export function quantile(values, fraction) {
+  if (!values.length) return 0
   const sorted = [...values].sort((a, b) => a - b)
-  const middle = Math.floor(sorted.length / 2)
-  return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2
+  const at = fraction * (sorted.length - 1)
+  const index = Math.floor(at)
+  return sorted[index] + (at - index) * ((sorted[index + 1] ?? sorted[index]) - sorted[index])
 }
-export function cvar(values, fraction = 0.2) {
-  return mean([...values].sort((a, b) => a - b).slice(0, Math.ceil(values.length * fraction)))
+export const median = values => quantile(values, 0.5)
+export const mad = values => {
+  const center = median(values)
+  return median(values.map(value => Math.abs(value - center)))
+}
+export function cvar(losses, fraction = 0.2) {
+  if (!losses.length) return 0
+  const mass = losses.length * fraction
+  const sorted = [...losses].sort((a, b) => b - a)
+  const whole = Math.floor(mass)
+  return (sorted.slice(0, whole).reduce((sum, item) => sum + item, 0) +
+    (mass - whole) * (sorted[whole] ?? 0)) / mass
 }
 
-export function calibrate(baseline, probes, version) {
-  const direction = baseline.metrics.score_direction === 'maximize' ? 1 : -1
-  const cases = baseline.metrics.seed_results
-  const fullProbes = probes.filter(probe => (probe.metrics.budget_fraction ?? 1) === 1)
-  const anchor = cases.map((item, index) => {
-    const scores = fullProbes.map(probe => probe.metrics.seed_results[index])
-      .filter(entry => entry.judge === 'ACCEPTED').map(entry => direction * entry.score)
-    const low = direction * item.score
-    const high = Math.max(low, ...scores)
-    const scale = Math.max(high - low, Math.abs(low) * 0.05)
-    if (!(scale > 0) || !Number.isFinite(scale)) {
-      throw new Error(`DART has degenerate anchors for seed ${item.seed}; supply a valid probe with a distinct score`)
-    }
-    return { seed: item.seed, low, high, scale }
+export function calibrate({ baseline, history, weights, settings, version }) {
+  const baselineCases = baseline.metrics.seed_results
+  const direction = directionOf(baseline)
+  const panels = history.map(item => item.raw)
+  const anchor = baselineCases.map((item, index) => {
+    const scores = panels.map(panel => panel[index]).filter(acceptedCase).map(record => record.score)
+    const localBest = scores.length ? direction * Math.max(...scores.map(score => score * direction)) : null
+    const tau = settings.score_unit ?? (Math.abs(item.score) * 0.05 || median(scores.map(Math.abs)) * 0.05 || 1)
+    const scale = Math.max(quantile(scores, 0.9) - quantile(scores, 0.1), 1.4826 * mad(scores), tau)
+    const mode = settings.gain_mode !== 'difference' && acceptedCase(item) && item.score > 0 &&
+      scores.every(score => score > 0) ? 'log' : 'difference'
+    return { seed: item.seed, baseline: item.score, baseline_valid: acceptedCase(item), localBest, scale, mode }
   })
-  const model = { version, direction, anchor }
-  const rows = probes.map(result => ({ result, vector: normalized(result, model) }))
-  const full = rows.filter(({ result }) => (result.metrics.budget_fraction ?? 1) === 1)
-  const halfBySource = new Map(rows.filter(({ result }) => result.metrics.budget_fraction === 0.5)
-    .map(row => [row.result.source_sha256, row]))
-  const grand = full.length ? mean(full.map(row => mean(row.vector))) : 0
-  model.cases = anchor.map((item, index) => {
-    const values = full.map(row => row.vector[index])
-    const difficulty = values.length ? grand - mean(values) : 0
-    const spread = values.length ? median(values.map(value => Math.abs(value - median(values)))) : 0
-    const accepted = row => row.result.metrics.seed_results[index].judge === 'ACCEPTED'
-    const pairs = full.flatMap(row => {
-      const half = halfBySource.get(row.result.source_sha256)
-      return half ? [{ row, half }] : []
-    })
-    const gains = pairs.filter(({ row, half }) => accepted(row) && accepted(half))
-      .map(({ row, half }) => row.vector[index] - half.vector[index])
-    return { seed: item.seed, index, difficulty, spread, observations: rows.length,
-      full_observations: full.length,
-      full_pass_rate: full.length ? full.filter(accepted).length / full.length : null,
-      half_timeouts: pairs.filter(({ half }) => half.result.metrics.seed_results[index].judge === 'TIME_LIMIT_EXCEEDED').length,
-      budget_gain: gains.length ? mean(gains) : null, budget_pairs: gains.length }
-  })
-  return model
+  const relative_mode = anchor.every(item => item.mode === 'log') ? 'ratio' : 'difference'
+  return { version, direction, anchor, relative_mode, family_count: new Set(weights.map(item => item.family)).size }
+}
+
+function coordinate(score, anchor, direction) {
+  if (anchor.mode === 'log' && score > 0) return direction * (Math.log(score) - Math.log(anchor.baseline))
+  return (direction * score - direction * anchor.baseline) / anchor.scale
+}
+export function gain(child, parent, anchor, direction) {
+  if (!acceptedCase(child) || !acceptedCase(parent)) return null
+  return anchor.mode === 'log' && child.score > 0 && parent.score > 0
+    ? direction * (Math.log(child.score) - Math.log(parent.score))
+    : (direction * child.score - direction * parent.score) / anchor.scale
 }
 
 export function normalized(result, model) {
-  return result.metrics.seed_results.map((item, index) => {
-    const { low, scale } = model.anchor[index]
-    return item.judge === 'ACCEPTED' ? (model.direction * item.score - low) / scale : -2
+  return model.anchor.map((anchor, index) => {
+    const item = result.metrics.seed_results[index]
+    return acceptedCase(item) ? coordinate(item.score, anchor, model.direction) : null
   })
 }
 
-export function decomposition(vector, model) {
-  const ability = mean(vector)
-  return { ability, interaction: vector.map((value, index) => value - ability + model.cases[index].difficulty) }
-}
-
-export function profiles(entries, model, champion) {
-  const vectors = entries.map(entry => entry.vector)
-  const cases = model.cases.map((item, index) => {
-    const values = vectors.map(row => row[index])
-    const gap = Math.max(0, ...values) - champion[index]
-    const response = entries.map(entry => entry.effects.interaction[index])
-    const center = mean(response)
-    const magnitude = Math.hypot(...response.map(value => value - center))
-    const signature = response.map(value => magnitude ? (value - center) / magnitude : 0)
-    return { ...item, index, gap, signature }
+const projection = (item, anchor, direction) => acceptedCase(item) && anchor.localBest !== null
+  ? Math.max(0, gain({ score: anchor.localBest, judge: 'ACCEPTED' }, item, anchor, direction)) : 1
+export function evaluateChannels(entry, model) {
+  const losses = model.anchor.map((anchor, index) => projection(entry.raw[index], anchor, model.direction))
+  const relative = model.anchor.map((anchor, index) => {
+    const item = entry.raw[index]
+    if (!acceptedCase(item)) return model.relative_mode === 'ratio' ? 0 : -1
+    if (model.relative_mode === 'difference') return (model.direction * item.score - model.direction * anchor.baseline) / anchor.scale
+    return model.direction === 1 ? item.score / anchor.localBest : anchor.localBest / item.score
   })
-  // Deterministic agglomeration using average linkage on interaction signatures.
-  const distances = cases.map(a => cases.map(b => {
-    const correlationDistance = mean(a.signature.map((value, k) => (value - b.signature[k]) ** 2))
-    return correlationDistance + 0.1 * (a.difficulty - b.difficulty) ** 2 + 0.1 * (a.gap - b.gap) ** 2
-  }))
-  const groups = cases.map(item => [item])
-  while (groups.length > Math.ceil(Math.sqrt(cases.length))) {
-    let best = [0, 1]
-    let distance = Infinity
-    for (let i = 0; i < groups.length; i++) {
-      for (let j = i + 1; j < groups.length; j++) {
-        const d = mean(groups[i].flatMap(a => groups[j].map(b => distances[a.index][b.index])))
-        if (d < distance) {
-          distance = d
-          best = [i, j]
-        }
-      }
-    }
-    groups[best[0]].push(...groups.splice(best[1], 1)[0])
-  }
-  return { cases: cases.map(({ signature, ...item }) => item), groups: groups.map(group => group.map(item => item.index)) }
+  return { original_score: entry.fitness, relative: mean(relative), cvar: cvar(losses), losses,
+    legal_rate: mean(entry.raw.map(item => Number(acceptedCase(item)))) }
 }
 
-export function archive(entries, groups, count = 2) {
-  return groups.map(group => [...entries].sort((a, b) =>
-    mean(group.map(index => b.vector[index])) - mean(group.map(index => a.vector[index]))
-  ).slice(0, count).map(entry => entry.id))
+export function regression(entry, reference, model, protectedCases, settings = {}) {
+  const perSeed = model.anchor.map((anchor, index) => {
+    const before = reference.raw[index]
+    if (!acceptedCase(before)) return 0
+    const change = gain(entry.raw[index], before, anchor, model.direction)
+    return change === null ? 1 : Math.max(0, -change)
+  })
+  const loss = mean(perSeed)
+  const allowed = loss <= (settings.mean_regression ?? 0.05) && protectedCases.every(index => {
+    const anchor = model.anchor[index]
+    const before = reference.raw[index]
+    const after = entry.raw[index]
+    if (!acceptedCase(before)) return true
+    if (!acceptedCase(after)) return false
+    // A baseline-relative raw limit is fixed across scale revisions.
+    const rawLoss = model.direction * (before.score - after.score)
+    return rawLoss <= (settings.protected_regression ?? 0.1) * Math.abs(before.score) &&
+      perSeed[index] <= (settings.protected_regression ?? 0.1)
+  })
+  return { allowed, loss, perSeed }
 }
 
-export function lexicase(entries, cases, random = Math.random) {
+export function utility(entry, parent, model, hard = []) {
+  const delta = model.anchor.map((anchor, index) => gain(entry.raw[index], parent.raw[index], anchor, model.direction))
+  const raw = clamp((entry.fitness - parent.fitness) / (Math.abs(parent.fitness) || Math.abs(entry.fitness) || 1), -1, 1)
+  const actual = delta.filter(value => value !== null)
+  return 0.25 * raw + 0.35 * mean(actual) + 0.15 * mean(hard.map(index => delta[index]).filter(value => value !== null)) +
+    0.25 * (parent.channels.cvar - entry.channels.cvar) - 0.3 * entry.regression.loss
+}
+
+export function weightedOrder(items, weight, random = Math.random) {
+  return items.map(item => ({ item, key: -Math.log(Math.max(Number.MIN_VALUE, random())) / Math.max(Number.MIN_VALUE, weight(item)) }))
+    .sort((a, b) => a.key - b.key).map(({ item }) => item)
+}
+
+export function lexicase(entries, cases, model, random = Math.random) {
   let remaining = entries
-  const order = cases.map(item => ({
-    ...item,
-    priority: -Math.log(Math.max(Number.MIN_VALUE, random())) /
-      (1 + Math.max(0, item.difficulty) + Math.max(0, item.gap)),
-  })).sort((a, b) => a.priority - b.priority)
-  for (const { index } of order) {
+  for (const { index } of weightedOrder(cases, item => item.priority, random)) {
     if (remaining.length <= 1) break
-    const feasible = remaining.filter(entry => !entry.raw || entry.raw[index].judge === 'ACCEPTED')
+    const feasible = remaining.filter(entry => acceptedCase(entry.raw[index]))
     if (!feasible.length) continue
-    remaining = feasible
-    const scores = remaining.map(entry => entry.vector[index])
-    const center = median(scores)
-    const epsilon = Math.min(0.25, median(scores.map(value => Math.abs(value - center))))
-    const cutoff = Math.max(...scores) - epsilon
-    remaining = remaining.filter(entry => entry.vector[index] >= cutoff)
+    const scores = feasible.map(entry => model.direction * entry.raw[index].score)
+    const scale = model.anchor[index].scale
+    const tolerance = Math.min(0.25, mad(scores) / scale) * scale
+    const best = Math.max(...scores)
+    remaining = feasible.filter((_, i) => best - scores[i] <= tolerance)
   }
-  return remaining[Math.floor(random() * remaining.length)].id
+  return remaining[Math.floor(random() * remaining.length)]
 }
-
-export function fixedEasyFloor(cases, baseline, model, tolerance = 0.10) {
-  const cutoff = median(model.cases.map(item => item.difficulty))
-  return model.cases.every(({ index, difficulty }) => {
-    const reference = baseline[index]
-    if (difficulty > cutoff || reference.judge !== 'ACCEPTED') return true
-    const result = cases[index]
-    const loss = model.direction * (reference.score - result.score)
-    return result.judge === 'ACCEPTED' && loss <= tolerance * Math.abs(reference.score)
-  })
-}
-
-export function guarded(vector, incumbent, model, tolerance = 0.10) {
-  const medianDifficulty = median(model.cases.map(item => item.difficulty))
-  const easy = model.cases.filter(item => item.difficulty <= medianDifficulty)
-  if (easy.some(({ index }) => vector[index] < -tolerance)) return false
-  const delta = vector.map((value, index) => value - incumbent[index])
-  return cvar(vector) >= cvar(incumbent) - 0.02 && cvar(delta) >= -0.15
-}
-
-export function utility(vector) {
-  return mean(vector) + 0.5 * cvar(vector)
-}
-

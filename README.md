@@ -24,8 +24,8 @@ Organon runs on the [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-h
 Organon/
 ├── setup.sh                 installs DSH, the plugins (with the preset) and the benchmark evaluators (one command)
 ├── PROMPT.md                the prompt to give an Evolve Mode session
-├── final_eval.py            final score of a finished ALE-Bench run (private evaluation)
-├── private_eval.py          the ALE-Bench private evaluation that final_eval.py runs
+├── final_eval.py            export the locally validated V4 solution
+├── private_eval.py          legacy private evaluation utility outside the V4 workflow
 ├── dist/                    prebuilt plugin tarballs — setup.sh installs these
 │   ├── dsh-candidate-builder-0.1.0.tgz
 │   └── dsh-evolve-loop-0.1.0.tgz

@@ -16,7 +16,7 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import { isAbsolute } from 'node:path'
 import { runPaths } from './candidates.js'
 import { filesOf } from './files.js'
-import { taskConfig } from './dart/store.js'
+import { readJson, taskConfig } from './dart/store.js'
 import { runStrategyTrial } from './dart/trial.js'
 
 /** The runner's id prefix for plugins these tools create (3–6 lowercase letters). */
@@ -190,7 +190,7 @@ export function registerRuntimeTools(ctx, evolve) {
       if (trials.size) throw new Error('Finish the pending DART strategy trial or deactivate its plugin first.')
       const files = dart ? filesOf(root) : undefined
       if (dart && !(await files.exists('dart/model.json'))) {
-        throw new Error('Complete the DART probe calibration before activating an experimental strategy.')
+        throw new Error('Run an initial DART search batch before activating an experimental strategy.')
       }
       const plugin = runner.inspectPlugin(agent, args.plugin_id)
       const packageId = typeof args.package_id === 'string' && args.package_id !== ''
@@ -325,7 +325,7 @@ export function registerRuntimeTools(ctx, evolve) {
     if (trial.running) throw new Error('A DART strategy trial is already running')
     trial.running = true
     try {
-      return await runStrategyTrial({
+      const result = await runStrategyTrial({
         trial,
         args,
         files: filesOf(root),
@@ -339,6 +339,11 @@ export function registerRuntimeTools(ctx, evolve) {
         },
         rollback: () => restore(runnerOf(ctx), agent, trial),
       })
+      if (result.dart_trial.status === 'validated') {
+        const refreshed = await evolve.run(args, { ...exec, refreshOnly: true })
+        return { ...result, ...refreshed }
+      }
+      return { ...result, submission_id: (await readJson(filesOf(root), 'dart/submission.json'))?.id }
     } finally {
       trials.delete(key)
     }

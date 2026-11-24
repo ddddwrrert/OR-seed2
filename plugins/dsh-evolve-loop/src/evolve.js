@@ -1,4 +1,4 @@
-﻿/**
+/**
  * The `evolve` service: Service Definition for the evolutionary search capability seam.
  *
  * Exposes swappable service provider slots ('loop' | 'select' | 'mutate' | 'evaluate' | 'survive')
@@ -7,7 +7,8 @@
  * @module dsh-evolve-loop/evolve
  */
 
-import { isAbsolute } from 'node:path'
+import { AsyncLocalStorage } from 'node:async_hooks'
+import { isAbsolute, relative, sep } from 'node:path'
 import loopProvider from './providers/loop.js'
 import selectProvider from './providers/select.js'
 import mutateProvider from './providers/mutate.js'
@@ -52,18 +53,19 @@ export class Evolve {
   ctx
   /** slot -> provider stack */
   #providers = new Map()
-  #dartProviders = new Map(Object.entries(DART_COMPONENTS).map(([slot, run]) => [slot, [{ name: 'default', run }]]))
+  #dartProviders = new Map(Object.entries(DART_COMPONENTS).map(([slot, run]) => [slot, [Object.freeze({ name: 'default', run })]]))
+  #customProvider = new AsyncLocalStorage()
   #trialCandidateCap
   /** Active run metadata */
   #current = undefined
 
   constructor(ctx) {
     this.ctx = ctx
-    this.#providers.set('loop', [loopProvider])
-    this.#providers.set('select', [selectProvider])
-    this.#providers.set('mutate', [mutateProvider])
-    this.#providers.set('evaluate', [evaluateProvider])
-    this.#providers.set('survive', [surviveProvider])
+    this.#providers.set('loop', [Object.freeze(loopProvider)])
+    this.#providers.set('select', [Object.freeze(selectProvider)])
+    this.#providers.set('mutate', [Object.freeze(mutateProvider)])
+    this.#providers.set('evaluate', [Object.freeze(evaluateProvider)])
+    this.#providers.set('survive', [Object.freeze(surviveProvider)])
   }
 
   /** Whether an evolve run is executing right now. */
@@ -181,7 +183,9 @@ export class Evolve {
     if (!this.currentRun().dart) throw new Error('This task has no DART protocol')
     const stack = this.#dartProviders.get(slot)
     if (!stack) throw new Error(`Unknown DART component: ${slot}`)
-    return await stack[defaultProvider ? 0 : stack.length - 1].run(input, this)
+    const provider = stack[defaultProvider ? 0 : stack.length - 1]
+    const custom = provider !== stack[0]
+    return await this.#customProvider.run(custom, () => provider.run(custom ? structuredClone(input) : input, this))
   }
 
   /**
@@ -212,7 +216,13 @@ export class Evolve {
     const { task } = workspace
     const root = exec.trialRoot ?? workspace.root
     const dart = await beginDart(task, root, maxBudget)
-    if (dart && exec.trialSeedCap !== undefined) dart.protocol.maxSeeds = exec.trialSeedCap
+    if (dart) {
+      if (exec.trialSeedCap !== undefined) dart.protocol.maxSeeds = exec.trialSeedCap
+      Object.freeze(dart.protocol.seeds)
+      Object.freeze(dart.protocol.validationSeeds)
+      Object.freeze(dart.protocol)
+      Object.freeze(dart)
+    }
     if (this.#current !== undefined) throw new Error('an evolve run is already in progress')
     this.#current = Object.freeze({
       dart,
@@ -238,7 +248,8 @@ export class Evolve {
       }
       try {
         await initializeDart(this)
-        return await finishDart(this, await runFn(args, this), preTrialIds)
+        if (exec.refreshOnly) return await finishDart(this, { refresh_only: true })
+        return await finishDart(this, await this.#invoke('loop', loop, () => runFn(args, this)), preTrialIds)
       } catch (error) {
         if (error.code !== 'DART_BUDGET') throw error
         return await finishDart(this, { seed_budget_exhausted: true }, preTrialIds)
@@ -251,21 +262,27 @@ export class Evolve {
 
   async dartStep() {
     if (!this.currentRun().dart) throw new Error('This task has no DART protocol')
-    return await dartStep(this)
+    return await this.#customProvider.run(false, () => dartStep(this))
   }
 
   async dartDiagnostics() {
     if (!this.currentRun().dart) throw new Error('This task has no DART protocol')
-    const { cases, groups, experts } = await snapshot(this)
-    return { cases, groups, experts }
+    const { cases, groups, archive, conflicts } = await this.#customProvider.run(false, () => snapshot(this))
+    return { cases, groups, experts: archive.cluster, archive, conflicts }
+  }
+
+  #invoke(slot, provider, call) {
+    if (!this.currentRun().dart) return call()
+    return this.#customProvider.run(provider !== this.#providers.get(slot)[0], call)
   }
 
   /** Selection delegate */
-  async select(population) {
+  async select(population, state) {
     const provider = this.getProvider('select')
     const fn = provider.select ?? provider
     if (typeof fn !== 'function') throw new Error('active select provider has no select method')
-    return await fn(population, this)
+    return await this.#invoke('select', provider, () => fn(population, this,
+      provider === this.#providers.get('select')[0] || !state ? state : structuredClone(state)))
   }
 
   /** Mutation delegate */
@@ -273,15 +290,15 @@ export class Evolve {
     const provider = this.getProvider('mutate')
     const fn = provider.mutate ?? provider.improve ?? provider
     if (typeof fn !== 'function') throw new Error('active mutate provider has no mutate method')
-    return await fn(options, this)
+    return await this.#invoke('mutate', provider, () => fn(options, this))
   }
 
   /** Evaluation delegate */
-  async evaluate(candidate) {
-    const provider = this.getProvider('evaluate')
+  async evaluate(candidate, { defaultProvider = false } = {}) {
+    const provider = defaultProvider ? this.#providers.get('evaluate')[0] : this.getProvider('evaluate')
     const fn = provider.evaluate ?? provider
     if (typeof fn !== 'function') throw new Error('active evaluate provider has no evaluate method')
-    return await fn(candidate, this)
+    return await this.#invoke('evaluate', provider, () => fn(candidate, this))
   }
 
   /** Survival delegate */
@@ -289,7 +306,7 @@ export class Evolve {
     const provider = this.getProvider('survive')
     const fn = provider.survive ?? provider
     if (typeof fn !== 'function') throw new Error('active survive provider has no survive method')
-    return await fn(population, this)
+    return await this.#invoke('survive', provider, () => fn(population, this))
   }
 
   /**
@@ -338,7 +355,19 @@ export class Evolve {
    * @returns {Readonly<object>} handle with resolve/write/append/read/list/exists/remove.
    */
   get files() {
-    return filesOf(this.currentRun().root)
+    const files = filesOf(this.currentRun().root)
+    if (!this.#customProvider.getStore()) return files
+    const check = path => {
+      const top = relative(files.root, files.resolve(path)).split(sep)[0].toLowerCase()
+      if (!top || ['budget.json', 'evals', 'candidates', 'dart'].includes(top)) {
+        throw new Error('DART provider cannot directly change host-managed run state')
+      }
+    }
+    return Object.freeze({ ...files,
+      write: async (path, text) => { check(path); return files.write(path, text) },
+      append: async (path, text) => { check(path); return files.append(path, text) },
+      remove: async path => { check(path); return files.remove(path) },
+    })
   }
 
   /** Context of the current run */

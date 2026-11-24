@@ -41,17 +41,16 @@ export async function evaluateResult(candidate, evolve, options = {}) {
   const ctx = evolve.ctx
   const settings = JSON.parse(await readFile(join(task, 'task.json'), 'utf8'))
 
-  const fraction = options.fraction ?? 1
   const seeds = options.seeds ?? dart?.protocol.seeds
   const purpose = options.purpose ?? 'search'
   const record = purpose === 'search' ? `evals/${candidate.id}.json` :
-    `dart/evidence/${candidate.id}-${purpose}-${fraction}.json`
+    `dart/evidence/${candidate.id}-${purpose}-1.json`
   let cache
   let sourceHash
   if (dart) {
     const source = await readFile(join(candidate.dir, settings.program))
     sourceHash = hash([source])
-    const key = hash([dart.protocol.version, JSON.stringify(seeds), String(fraction), source])
+    const key = hash([dart.protocol.version, JSON.stringify(seeds), source])
     cache = `dart/cache/${key}.json`
     const hit = settings.dart.disable_cache ? undefined : await readJson(evolve.files, cache)
     if (hit) {
@@ -59,7 +58,7 @@ export async function evaluateResult(candidate, evolve, options = {}) {
       await writeJson(evolve.files, record, evidence)
       return evidence
     }
-    await reserve(evolve, seeds.length, `${candidate.id}/${purpose}/${fraction}`)
+    await reserve(evolve, seeds.length, `${candidate.id}/${purpose}`)
   }
 
   const subprocess = ctx.get('subprocess')
@@ -88,7 +87,7 @@ export async function evaluateResult(candidate, evolve, options = {}) {
       env: {
         ...settings.env, TMPDIR: scratch, TEMP: scratch, TMP: scratch,
         ...(dart ? {
-          OR_SEEDS: JSON.stringify(seeds), OR_BUDGET_FRACTION: String(fraction),
+          OR_SEEDS: JSON.stringify(seeds),
           OR_TRACE_FILE: trace, OR_SINGLE_ATTEMPT: '1',
         } : {}),
       },
