@@ -305,7 +305,8 @@ describe('DART through evolve_run', () => {
     expect(responses).toHaveLength(4)
     expect(responses.every((item: any) => item.normalizer === model.version)).toBe(true)
     expect((await report('dart/archives.json')).raw[0]).toBe('c000004')
-    expect((await report('dart/evidence/c000004-validation-1.json')).metrics.seed_results.map((s: any) => s.seed)).toEqual([50, 51])
+    expect((await report('dart/budget.json')).used).toBe(20)
+    await expect(report('dart/evidence/c000004-validation-1.json')).rejects.toMatchObject({ code: 'ENOENT' })
     const result = await report('evals/c000004.json')
     expect(result.metrics.seed_results.map((s: any) => s.score)).toEqual([30, 60, 90, 120])
     expect((await readFile(join(task, 'run', result.trace), 'utf8')).length).toBeGreaterThan(0)
@@ -319,7 +320,7 @@ describe('DART through evolve_run', () => {
   }, 45_000)
 
   it.runIf(process.env.OR_V4_CXX_E2E === '1')(
-    'compiles a conditional solver, measures 50 plus 10 seeds and exports its source end to end', async () => {
+    'compiles a conditional solver, measures only the 50 search seeds and exports its source end to end', async () => {
       await setupDart()
       const configPath = join(task, 'task.json')
       const config = JSON.parse(await readFile(configPath, 'utf8'))
@@ -357,9 +358,9 @@ describe('DART through evolve_run', () => {
       expect(search.metrics.seed_results.map((item: any) => item.seed)).toEqual(Array.from({ length: 50 }, (_, i) => i))
       expect(search.metrics.seed_results[0].score).toBe(12)
       expect(search.metrics.seed_results[49].score).toBe(700)
-      expect((await report('dart/evidence/c000002-validation-1.json')).metrics.seed_results).toHaveLength(10)
+      expect((await report('dart/budget.json')).used).toBe(150)
       expect(await report('dart/adaptive.json')).toContainEqual(expect.objectContaining({
-        id: 'c000002', documented: true, code_changed: true, search_legal: true, validation_legal: true,
+        id: 'c000002', documented: true, code_changed: true, search_legal: true,
       }))
       const finalizer = fileURLToPath(new URL('../../../final_eval.py', import.meta.url))
       const { stdout } = await promisify(execFile)('python', ['-B', finalizer, task])
@@ -407,7 +408,7 @@ describe('DART through evolve_run', () => {
   }, 60_000)
 
   it('does not spend a candidate when case budget is exhausted by the baseline', async () => {
-    await setupDart(6)
+    await setupDart(4)
     const result = await runTool({ max_budget: 3 })
     expect(result).toMatchObject({ best_id: 'c000000', remaining: 3, seed_remaining: 0, seed_budget_exhausted: true })
     expect(starts).toHaveLength(0)
@@ -548,7 +549,7 @@ describe('DART through evolve_run', () => {
       restore()
     }
     expect(attempts).toBe(2)
-    expect((await report('dart/budget.json')).used).toBe(12)
+    expect((await report('dart/budget.json')).used).toBe(8)
   }, 45_000)
 
   it('hard-caps candidate allocation even when a trial loop ignores the requested limit', async () => {

@@ -89,7 +89,7 @@ async function mergeChampion(files, treatment) {
   const row = (await source.read('population.jsonl')).split('\n').filter(Boolean)
     .map(line => JSON.parse(line)).find(item => item.id === id)
   if (!row) throw new Error('DART trial champion is missing its population entry')
-  const records = [`evals/${id}.json`, `dart/evidence/${id}-validation-1.json`]
+  const records = [`evals/${id}.json`]
   const evidenceFiles = new Map()
   for (const path of records) {
     const evidence = await readJson(source, path)

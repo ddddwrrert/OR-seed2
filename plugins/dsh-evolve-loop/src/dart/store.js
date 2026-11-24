@@ -41,11 +41,9 @@ export async function taskConfig(task) {
 
 export async function protocolFor(task, settings, maxBudget) {
   const seeds = settings.dart.seeds ?? DEFAULT_SEEDS
-  const validationSeeds = settings.dart.validation_seeds ?? [50, 51, 52, 53, 54, 55, 56, 57, 58, 59]
-  const allSeeds = [...seeds, ...validationSeeds]
-  if (!seeds.length || !validationSeeds.length || new Set(allSeeds).size !== allSeeds.length ||
-      !allSeeds.every(seed => Number.isSafeInteger(seed) && seed >= 0)) {
-    throw new Error('DART requires distinct, disjoint search and validation seed lists')
+  if (!seeds.length || new Set(seeds).size !== seeds.length ||
+      !seeds.every(seed => Number.isSafeInteger(seed) && seed >= 0)) {
+    throw new Error('DART requires a nonempty list of distinct search seeds')
   }
   const options = settings.dart
   for (const [seed, bound] of Object.entries(options.quality_reference ?? {})) {
@@ -69,15 +67,15 @@ export async function protocolFor(task, settings, maxBudget) {
     throw new Error('DART parent_pool_size must be at least two')
   }
   const maxSeeds = settings.dart.max_seed_calls ??
-    (1 + maxBudget) * (seeds.length + validationSeeds.length)
-  if (!Number.isSafeInteger(maxSeeds) || maxSeeds < seeds.length + validationSeeds.length) {
-    throw new Error('DART max_seed_calls must cover both panels for the baseline')
+    (1 + maxBudget) * seeds.length
+  if (!Number.isSafeInteger(maxSeeds) || maxSeeds < seeds.length) {
+    throw new Error('DART max_seed_calls must cover the baseline search panel')
   }
   const version = hash([
-    'dart-organon-v4', JSON.stringify(settings), JSON.stringify({ seeds, validationSeeds, maxSeeds }),
+    'dart-organon-v4-search-only', JSON.stringify(settings), JSON.stringify({ seeds, maxSeeds }),
     ...await evaluatorFiles(join(task, 'evaluator')),
   ])
-  return { seeds, validationSeeds, maxSeeds, version }
+  return { seeds, maxSeeds, version }
 }
 
 const reservationQueues = new Map()

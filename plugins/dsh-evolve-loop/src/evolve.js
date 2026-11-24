@@ -219,7 +219,6 @@ export class Evolve {
     if (dart) {
       if (exec.trialSeedCap !== undefined) dart.protocol.maxSeeds = exec.trialSeedCap
       Object.freeze(dart.protocol.seeds)
-      Object.freeze(dart.protocol.validationSeeds)
       Object.freeze(dart.protocol)
       Object.freeze(dart)
     }

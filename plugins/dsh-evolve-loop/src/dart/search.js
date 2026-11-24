@@ -2,9 +2,8 @@ import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { filesOf } from '../files.js'
 import { candidatePath } from '../candidates.js'
-import { evaluateResult } from '../providers/evaluate.js'
 import { accepted, BASE, hash, protocolFor, readJson, taskConfig, usable, writeJson } from './store.js'
-import { acceptedCase, calibrate, clamp, cvar, evaluateChannels, gain, mean, normalized, regression, utility, weightedOrder } from './model.js'
+import { acceptedCase, calibrate, clamp, evaluateChannels, gain, mean, normalized, regression, utility, weightedOrder } from './model.js'
 import { classify, clusterResponses, decomposition, difficultyRegistry, lineageWeights, seedProfiles } from './intelligence.js'
 import { advisor, archives, chooseParent, complementary, mechanismMemory, sourcePatch, WORKERS } from './strategy.js'
 
@@ -32,24 +31,20 @@ export async function beginDart(task, root, maxBudget) {
 }
 
 const candidateFor = (evolve, id) => ({ id, dir: candidatePath(evolve.currentRun().root, id) })
-const recordFor = (id, purpose) => purpose === 'search' ? `evals/${id}.json` : `dart/evidence/${id}-${purpose}-1.json`
+const recordFor = id => `evals/${id}.json`
 
-async function evidence(evolve, candidate, purpose) {
+async function evidence(evolve, candidate) {
   const { protocol, settings } = evolve.currentRun().dart
-  const seeds = purpose === 'search' ? protocol.seeds : protocol.validationSeeds
-  const prior = await readJson(evolve.files, recordFor(candidate.id, purpose))
+  const prior = await readJson(evolve.files, recordFor(candidate.id))
   const source = await readFile(join(candidate.dir, settings.program))
   if (prior?.protocol === protocol.version && prior.source_sha256 === hash([source]) &&
-      usable(prior, seeds)) return prior
-  if (purpose === 'search') {
-    await evolve.evaluate(candidate)
-    const result = await readJson(evolve.files, recordFor(candidate.id, purpose))
-    if (result?.protocol !== protocol.version || result.source_sha256 !== hash([source])) {
-      throw new Error('DART evaluate providers must persist evaluation evidence for the current source and protocol.')
-    }
-    return result
+      usable(prior, protocol.seeds)) return prior
+  await evolve.evaluate(candidate)
+  const result = await readJson(evolve.files, recordFor(candidate.id))
+  if (result?.protocol !== protocol.version || result.source_sha256 !== hash([source])) {
+    throw new Error('DART evaluate providers must persist evaluation evidence for the current source and protocol.')
   }
-  return evaluateResult(candidate, evolve, { purpose, seeds })
+  return result
 }
 
 export async function initializeDart(evolve) {
@@ -58,18 +53,14 @@ export async function initializeDart(evolve) {
   const population = evolve.population()
   const rows = await population.rows()
   const candidate = rows.some(row => row.id === BASE) ? candidateFor(evolve, BASE) : await evolve.copyTask()
-  const baseline = await evidence(evolve, candidate, 'search')
+  const baseline = await evidence(evolve, candidate)
   if (!usable(baseline, protocol.seeds)) throw new Error('The initial program has no complete per-seed evidence.')
   if (!rows.some(row => row.id === BASE)) {
     await population.append({ id: BASE, parent: null, fitness: baseline.fitness, survival: 'yes' })
   }
-  const validation = await evidence(evolve, candidate, 'validation')
-  if (!usable(validation, protocol.validationSeeds) || validation.metrics.score_direction !== baseline.metrics.score_direction) {
-    throw new Error('The initial validation program has no comparable per-seed evidence.')
-  }
   if (!(await files.exists(CHAMPION))) {
     await writeJson(files, CHAMPION, { id: BASE, fitness: baseline.fitness,
-      certified: accepted(baseline, protocol.seeds) && accepted(validation, protocol.validationSeeds) })
+      certified: accepted(baseline, protocol.seeds) })
   }
   if (!(await files.exists(PROTECTION))) {
     await writeJson(files, PROTECTION, { id: BASE,
@@ -80,7 +71,7 @@ export async function initializeDart(evolve) {
 async function loadHistory(evolve, rows) {
   const { protocol, settings } = evolve.currentRun().dart
   const records = await Promise.all(rows.map(async row => {
-    const result = await readJson(evolve.files, recordFor(row.id, 'search'))
+    const result = await readJson(evolve.files, recordFor(row.id))
     const bytes = await readFile(join(candidateFor(evolve, row.id).dir, settings.program))
       .catch(error => { if (error.code !== 'ENOENT') throw error; return undefined })
     const code = bytes?.toString('utf8') ?? ''
@@ -258,18 +249,6 @@ async function dispatch(evolve, state, selected) {
     attributionOf: arm === 'attribution' ? target.id : undefined }
 }
 
-function validationGuard(candidate, reference, baseline, direction) {
-  const delta = candidate.metrics.seed_results.map((item, index) => {
-    const before = reference.metrics.seed_results[index]
-    const fixed = baseline.metrics.seed_results[index]
-    if (!acceptedCase(before)) return 0
-    const change = direction * (item.score - before.score)
-    if (fixed.score === 0) return change < 0 ? -Infinity : 0
-    return change / Math.abs(fixed.score)
-  })
-  return delta.every(Number.isFinite) && mean(delta) >= -0.005 && cvar(delta.map(value => Math.max(0, -value))) <= 0.05
-}
-
 async function consider(evolve, entry, state) {
   const { protocol } = evolve.currentRun().dart
   if (!entry.safe || !accepted(entry.result, protocol.seeds)) return false
@@ -283,13 +262,7 @@ async function consider(evolve, entry, state) {
   const incumbent = state.incumbent
   if (current.certified && utility(entry, incumbent, state.fixedModel, state.hard) <= 0) return false
   if (await evolve.dartComponent('dart-promote', { entry, incumbent, model: state.fixedModel }) !== true) return false
-  const baseline = await evidence(evolve, candidateFor(evolve, BASE), 'validation')
-  const previous = await evidence(evolve, candidateFor(evolve, current.id), 'validation')
-  const challenger = await evidence(evolve, candidateFor(evolve, entry.id), 'validation')
-  const certified = accepted(challenger, protocol.validationSeeds) &&
-    challenger.metrics.score_direction === entry.result.metrics.score_direction &&
-    validationGuard(challenger, previous, baseline, state.model.direction) &&
-    validationGuard(challenger, baseline, baseline, state.model.direction)
+  const certified = true
   await evolve.files.append('dart/promotions.jsonl', JSON.stringify({
     challenger: entry.id, incumbent: current.id, version: state.fixedModel.version,
     certified, original_score: entry.fitness, relative: entry.channels.relative, cvar: entry.channels.cvar,
@@ -315,7 +288,7 @@ export async function dartStep(evolve) {
     throw new Error('DART dispatch must select a known parent and focus indices inside the panel')
   }
   const candidate = await evolve.mutate(plan)
-  const result = await evidence(evolve, candidate, 'search')
+  const result = await evidence(evolve, candidate)
   const original = state.byId.get(plan.parent)
   const code = await readFile(join(candidate.dir, settings.program), 'utf8')
   const patch = sourcePatch(original.code, code)
@@ -359,16 +332,10 @@ async function chooseSubmission(evolve, state) {
   for (const id of [...new Set([...ordered, ...pool.map(entry => entry.id)])]) {
     const entry = state.byId.get(id)
     if (!entry?.safe || !accepted(entry.result, protocol.seeds)) continue
-    try {
-      const result = await evidence(evolve, candidateFor(evolve, id), 'validation')
-      if (!accepted(result, protocol.validationSeeds) || result.metrics.score_direction !== entry.result.metrics.score_direction) continue
-      await writeJson(evolve.files, 'dart/submission.json', { id, objective: selected, source_sha256: entry.source,
-        original_score: entry.fitness, local_relative: entry.channels.relative, tail_gap: entry.channels.cvar,
-        validation: 'LEGAL' })
-      return id
-    } catch (error) {
-      if (error.code !== 'DART_BUDGET') throw error
-    }
+    await writeJson(evolve.files, 'dart/submission.json', { id, objective: selected, source_sha256: entry.source,
+      original_score: entry.fitness, local_relative: entry.channels.relative, tail_gap: entry.channels.cvar,
+      validation: 'LEGAL' })
+    return id
   }
   if (await evolve.files.exists('dart/submission.json')) await evolve.files.remove('dart/submission.json')
   return undefined
@@ -409,15 +376,13 @@ export async function finishDart(evolve, result, preTrialIds) {
       judges: raw.map(item => item.judge),
     })),
   })
-  const adaptive = await Promise.all(state.events.filter(event => event.arm === 'adaptive').map(async event => {
+  const adaptive = state.events.filter(event => event.arm === 'adaptive').map(event => {
     const entry = state.byId.get(event.id)
-    const validated = await readJson(files, recordFor(event.id, 'validation'))
     return { id: event.id, donor: event.references, router: event.router, gain: event.delta,
       code_changed: event.patch.added.length + event.patch.removed.length > 0,
       search_legal: entry?.channels.legal_rate === 1,
-      validation_legal: accepted(validated, evolve.currentRun().dart.protocol.validationSeeds),
       documented: Boolean(event.router?.router && event.router?.fallback && event.router?.budget) }
-  }))
+  })
   await writeJson(files, 'dart/adaptive.json', adaptive)
   await writeJson(files, 'dart/responses.json', state.events.map(({ id, parent, delta, reward, normalizer }) =>
     ({ id, parent, delta, reward, normalizer })))

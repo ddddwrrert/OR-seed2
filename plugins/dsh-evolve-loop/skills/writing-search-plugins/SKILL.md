@@ -77,4 +77,4 @@ After a failure, define a new version under the same `plugin_id`; do not overwri
 
 ## ALE-Bench DART components
 
-For an ALE-Bench DART task, call evolve_plugins to discover independent components. In a dynamic host plugin, use ctx.effect(() => ctx.evolve.register('dart-arm', { name, run(input, evolve) })) or register another dart-* slot. Within a component or custom provider, evolve.dartComponent(slot, input) invokes the active component. Pass { defaultProvider: true } as the third argument to compose with its default. The raw easy-case floor, canonical CVaR checks, validation panel, and trial allocation cap are enforced by the host.
+For an ALE-Bench DART task, call evolve_plugins to discover independent components. In a dynamic host plugin, use ctx.effect(() => ctx.evolve.register('dart-arm', { name, run(input, evolve) })) or register another dart-* slot. Within a component or custom provider, evolve.dartComponent(slot, input) invokes the active component. Pass { defaultProvider: true } as the third argument to compose with its default. The host enforces the raw easy-case floor, canonical CVaR checks, search-panel legality, and trial allocation cap.
