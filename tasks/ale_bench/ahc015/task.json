@@ -1,0 +1,9 @@
+{
+  "program": "solution.cpp",
+  "timeout": 10000,
+  "max_retries": 3,
+  "sandbox": false,
+  "dart": {
+    "enabled": true
+  }
+}
